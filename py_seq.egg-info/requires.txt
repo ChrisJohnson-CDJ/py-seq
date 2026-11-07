@@ -1,0 +1,6 @@
+python-rtmidi>=1.5.8
+mido>=1.3.3
+pytest>=8.0.0
+
+[gui]
+pygame<3,>=2.6

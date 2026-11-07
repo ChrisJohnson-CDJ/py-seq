@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-seq"
+version = "0.1.0"
+description = "Four-channel MIDI looper with a Pygame interface"
+readme = "readme.md"
+requires-python = ">=3.12.3,<3.13"
+dependencies = [
+  "python-rtmidi>=1.5.8",
+  "mido>=1.3.3",
+  "pytest>=8.0.0",
+]
+
+[project.optional-dependencies]
+gui = [
+  "pygame>=2.6,<3",
+]
+
+[project.scripts]
+py-seq-gui = "py_seq.pygame_gui:main"
+
+[tool.setuptools.packages.find]
+include = [
+  "py_seq*",
+  "pre_processor*",
+  "tape*",
+  "recorder*",
+  "interval_resolver*",
+  "playback_scheduler*",
+  "articulator*",
+  "midi_output*",
+  "playback_coordinator*",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

@@ -1,0 +1,2 @@
+[console_scripts]
+py-seq-gui = py_seq.pygame_gui:main
