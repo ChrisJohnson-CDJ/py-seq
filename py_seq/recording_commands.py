@@ -20,9 +20,9 @@ class RecordingSyncCommand:
     stop_mode: RecordingStopMode | None = None
     reference_channel: int | None = None
     start_beat_count: int | None = None
-    stop_beat_count: int | None = None
     start_gesture_count: int | None = None
     stop_gesture_count: int | None = None
+    stop_gesture_cycle: bool | None = None
     stop_after_ticks: int | None = None
 
 
@@ -127,6 +127,27 @@ def parse_recording_sync_command(command: str) -> RecordingSyncCommand:
     if parts[0:2] == ["stop", "beat"] and len(parts) == 3:
         raise ValueError("use 'stop beat' or 'stop after {beats}[+{n}[/{m}]]'")
 
+    if parts[:2] == ["stop", "gesture"]:
+        suffix = parts[2:]
+        cycle = bool(suffix and suffix[-1] in ("cycle", "cyc"))
+        count_parts = suffix[:-1] if cycle else suffix
+        if len(count_parts) > 1:
+            raise ValueError("use 'stop gesture [N] [cycle|cyc]'")
+        count = 1
+        if count_parts:
+            if re.fullmatch(r"[0-9]+", count_parts[0]) is None or int(
+                count_parts[0]
+            ) < 1:
+                raise ValueError(
+                    "synchronization count must be a positive whole number"
+                )
+            count = int(count_parts[0])
+        return RecordingSyncCommand(
+            stop_mode=RecordingStopMode.NEXT_GESTURE,
+            stop_gesture_count=count,
+            stop_gesture_cycle=cycle,
+        )
+
     if (
         len(parts) not in (2, 3)
         or parts[0] not in ("start", "stop")
@@ -169,7 +190,6 @@ def parse_recording_sync_command(command: str) -> RecordingSyncCommand:
     if parts[0] == "stop" and parts[1] in stop_modes:
         return RecordingSyncCommand(
             stop_mode=stop_modes[parts[1]],
-            stop_beat_count=beat_count if parts[1] == "beat" else None,
             stop_gesture_count=gesture_count,
         )
     choices = (

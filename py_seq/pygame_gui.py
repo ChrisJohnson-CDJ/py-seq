@@ -131,8 +131,6 @@ def _footer_lines(
     )
     if snapshot.recording_start_beat_count is not None:
         start_mode = f"{start_mode} {snapshot.recording_start_beat_count}"
-    if snapshot.recording_stop_beat_count is not None:
-        stop_mode = f"{stop_mode} {snapshot.recording_stop_beat_count}"
     if snapshot.recording_stop_after_ticks is not None:
         stop_mode = (
             f"{stop_mode} "
@@ -142,6 +140,8 @@ def _footer_lines(
         start_mode = f"{start_mode} {snapshot.recording_start_gesture_count}"
     if snapshot.recording_stop_gesture_count is not None:
         stop_mode = f"{stop_mode} {snapshot.recording_stop_gesture_count}"
+    if snapshot.recording_stop_gesture_cycle:
+        stop_mode = f"{stop_mode} CYCLE"
     configuration = (
         f"BEAT {_format_beat_position(display_beats)}  REC {snapshot.recording_state}  "
         f"START {start_mode}  STOP {stop_mode}  REF {reference}  "
@@ -957,6 +957,11 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                 ),
                                 "WAITING_STOP": "RECORDING",
                             }[state]
+                            if (
+                                state == "WAITING_STOP"
+                                and snapshot.recording_stop_gesture_cycle
+                            ):
+                                next_state = "IDLE"
                             changes: dict[str, object] = {
                                 "recording_state": next_state,
                                 "recording_armed": next_state != "IDLE",

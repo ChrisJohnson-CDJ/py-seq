@@ -142,12 +142,13 @@ class FourChannelSession:
         self._start_mode = RecordingStartMode.IMMEDIATE
         self._stop_mode = RecordingStopMode.IMMEDIATE
         self._start_beat_count: int | None = None
-        self._stop_beat_count: int | None = None
         self._stop_after_ticks: int | None = None
         self._start_gesture_count: int | None = None
         self._stop_gesture_count: int | None = None
+        self._stop_gesture_cycle = False
         self._start_gestures_remaining: int | None = None
         self._stop_gestures_remaining: int | None = None
+        self._cycle_waiting_for_start = False
         self._reference_channel: int | None = None
         self._pending_boundary_tick: int | None = None
         self._pending_reference_signature: tuple[int, int] | None = None
@@ -212,16 +213,16 @@ class FourChannelSession:
         return self._stop_mode
 
     @property
-    def stop_beat_count(self) -> int | None:
-        return self._stop_beat_count
-
-    @property
     def stop_after_ticks(self) -> int | None:
         return self._stop_after_ticks
 
     @property
     def stop_gesture_count(self) -> int | None:
         return self._stop_gesture_count
+
+    @property
+    def stop_gesture_cycle(self) -> bool:
+        return self._stop_gesture_cycle
 
     @property
     def reference_channel(self) -> int | None:
@@ -455,7 +456,10 @@ class FourChannelSession:
         elif self._recording_state is RecordingState.RECORDING:
             self.request_recording_stop()
         else:
-            self.cancel_pending_stop()
+            if self._cycle_waiting_for_start:
+                self.set_recording_armed(False)
+            else:
+                self.cancel_pending_stop()
 
     def set_recording_armed(self, armed: bool) -> None:
         if not isinstance(armed, bool):
@@ -507,9 +511,9 @@ class FourChannelSession:
         stop_mode: RecordingStopMode | None = None,
         reference_channel: int | None = None,
         start_beat_count: int | None = None,
-        stop_beat_count: int | None = None,
         start_gesture_count: int | None = None,
         stop_gesture_count: int | None = None,
+        stop_gesture_cycle: bool | None = None,
         stop_after_ticks: int | None = None,
     ) -> None:
         if start_mode is not None and not isinstance(start_mode, RecordingStartMode):
@@ -519,9 +523,12 @@ class FourChannelSession:
         if reference_channel is not None:
             reference_channel = self._channel_index(reference_channel)
         self._validate_sync_count(start_beat_count, "start_beat_count")
-        self._validate_sync_count(stop_beat_count, "stop_beat_count")
         self._validate_sync_count(start_gesture_count, "start_gesture_count")
         self._validate_sync_count(stop_gesture_count, "stop_gesture_count")
+        if stop_gesture_cycle is not None and not isinstance(
+            stop_gesture_cycle, bool
+        ):
+            raise TypeError("stop_gesture_cycle must be a bool")
         self._validate_stop_duration(stop_after_ticks)
         if self._recording_state in (
             RecordingState.WAITING_START,
@@ -530,6 +537,23 @@ class FourChannelSession:
             raise RuntimeError("cancel the pending recording boundary before reconfiguring")
         next_start_mode = self._start_mode if start_mode is None else start_mode
         next_stop_mode = self._stop_mode if stop_mode is None else stop_mode
+        if stop_gesture_cycle and next_stop_mode is not RecordingStopMode.NEXT_GESTURE:
+            raise ValueError(
+                "cycle stop synchronization requires gesture synchronization"
+            )
+        next_stop_gesture_cycle = (
+            (
+                bool(stop_gesture_cycle)
+                if stop_gesture_cycle is not None
+                else False
+            )
+            if stop_mode is not None
+            else (
+                self._stop_gesture_cycle
+                if stop_gesture_cycle is None
+                else stop_gesture_cycle
+            )
+        )
         next_reference_channel = (
             self._reference_channel
             if reference_channel is None
@@ -541,13 +565,6 @@ class FourChannelSession:
             start_mode,
             start_beat_count,
             next_start_mode,
-        )
-        next_stop_beat_count = self._next_beat_count(
-            self._stop_mode,
-            self._stop_beat_count,
-            stop_mode,
-            stop_beat_count,
-            next_stop_mode,
         )
         next_stop_after_ticks = self._next_stop_duration(
             self._stop_mode,
@@ -597,10 +614,10 @@ class FourChannelSession:
         self._start_mode = next_start_mode
         self._stop_mode = next_stop_mode
         self._start_beat_count = next_start_beat_count
-        self._stop_beat_count = next_stop_beat_count
         self._stop_after_ticks = next_stop_after_ticks
         self._start_gesture_count = next_start_gesture_count
         self._stop_gesture_count = next_stop_gesture_count
+        self._stop_gesture_cycle = next_stop_gesture_cycle
         self._reference_channel = next_reference_channel
         if self._recording_state is RecordingState.RECORDING:
             if self._stop_mode is RecordingStopMode.AFTER_DURATION:
@@ -641,7 +658,7 @@ class FourChannelSession:
                 self._pending_boundary_tick = self._next_global_boundary(
                     self.current_tick,
                     self._stop_mode,
-                    self._stop_beat_count,
+                    None,
                 )
         except Exception:
             self._recording_state = RecordingState.RECORDING
@@ -723,9 +740,12 @@ class FourChannelSession:
     def clear_tape(self, channel: int) -> None:
         channel = self._channel_index(channel)
         if (
-            self._recording_state in (
-                RecordingState.WAITING_START,
-                RecordingState.WAITING_STOP,
+            (
+                self._recording_state is RecordingState.WAITING_START
+                or (
+                    self._recording_state is RecordingState.WAITING_STOP
+                    and not self._cycle_waiting_for_start
+                )
             )
             and self._reference_channel == channel
         ):
@@ -854,6 +874,11 @@ class FourChannelSession:
         if voice_event is not None:
             if (
                 voice_event.kind is VoiceEventType.VOICE_START
+                and self._cycle_waiting_for_start
+            ):
+                self._finish_recording_window(tick)
+            if (
+                voice_event.kind is VoiceEventType.VOICE_START
                 and self.transport_running
                 and self._recording_state is RecordingState.WAITING_START
                 and self._start_mode is RecordingStartMode.NEXT_GESTURE
@@ -923,6 +948,7 @@ class FourChannelSession:
         self._pending_boundary_tick = None
         self._pending_reference_signature = None
         self._start_gestures_remaining = None
+        self._cycle_waiting_for_start = False
         if self._stop_mode is RecordingStopMode.NEXT_GESTURE:
             self._stop_gestures_remaining = self._stop_gesture_count or 1
         else:
@@ -957,6 +983,7 @@ class FourChannelSession:
         self._pending_reference_signature = None
         self._start_gestures_remaining = None
         self._stop_gestures_remaining = None
+        self._cycle_waiting_for_start = False
 
     def _require_recording_channel(self) -> int:
         if self._recording_channel is None:
@@ -1052,7 +1079,11 @@ class FourChannelSession:
             raise RuntimeError("gesture-synchronized stop has no remaining count")
         self._stop_gestures_remaining -= 1
         if self._stop_gestures_remaining == 0:
-            self._finish_recording_window(tick)
+            if self._stop_gesture_cycle:
+                self._recording_state = RecordingState.WAITING_STOP
+                self._cycle_waiting_for_start = True
+            else:
+                self._finish_recording_window(tick)
 
     @staticmethod
     def _validate_sync_count(count: int | None, name: str) -> None:

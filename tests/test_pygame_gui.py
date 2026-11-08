@@ -189,6 +189,10 @@ def test_recording_sync_command_parser_supports_modes_and_reference_channel():
         == 3900
     )
     assert (
+        parse_recording_sync_command("stop after 4+0").stop_after_ticks
+        == 4 * 960
+    )
+    assert (
         parse_recording_sync_command("stop after 4+3/8").stop_after_ticks
         == 4200
     )
@@ -202,6 +206,21 @@ def test_recording_sync_command_parser_supports_modes_and_reference_channel():
     assert (
         parse_recording_sync_command("stop gesture 3").stop_gesture_count == 3
     )
+    assert parse_recording_sync_command(
+        "stop gesture cycle"
+    ).stop_gesture_count == 1
+    assert parse_recording_sync_command(
+        "stop gesture cycle"
+    ).stop_gesture_cycle
+    assert parse_recording_sync_command(
+        "stop gesture cyc"
+    ).stop_gesture_cycle
+    assert parse_recording_sync_command(
+        "stop gesture 3 cyc"
+    ).stop_gesture_count == 3
+    assert parse_recording_sync_command(
+        "stop gesture 3 cycle"
+    ).stop_gesture_cycle
     assert parse_recording_sync_command("start beat").start_beat_count is None
     assert parse_recording_sync_command("reference 4").reference_channel == 3
 
@@ -225,6 +244,11 @@ def test_recording_sync_command_parser_supports_modes_and_reference_channel():
         "stop after",
         "start gesture 0",
         "stop gesture 1.5",
+        "start gesture cycle",
+        "start gesture 2 cyc",
+        "stop beat 2 cyc",
+        "stop immediate cycle",
+        "stop after 1 cyc",
     ):
         with pytest.raises(ValueError):
             parse_recording_sync_command(command)
@@ -409,7 +433,6 @@ def test_gui_footer_keeps_recording_configuration_separate_from_status():
         replace(
             snapshot,
             recording_start_beat_count=2,
-            recording_stop_beat_count=3,
             reset_mode="BEAT",
             reset_interval_beats=3.375,
         ),
@@ -419,7 +442,7 @@ def test_gui_footer_keeps_recording_configuration_separate_from_status():
         "",
     )
     assert "START BEAT 2" in counted
-    assert "STOP LOOP 3" in counted
+    assert "STOP LOOP" in counted
     assert "RESET BEAT 3.375" in counted
     gestures, _ = _footer_lines(
         replace(
@@ -435,6 +458,19 @@ def test_gui_footer_keeps_recording_configuration_separate_from_status():
         "",
     )
     assert "START GESTURE 2" in gestures
+    cycle, _ = _footer_lines(
+        replace(
+            snapshot,
+            recording_stop_mode="NEXT_GESTURE",
+            recording_stop_gesture_count=3,
+            recording_stop_gesture_cycle=True,
+        ),
+        1.0,
+        False,
+        "",
+        "",
+    )
+    assert "STOP GESTURE 3 CYCLE" in cycle
     assert "STOP GESTURE 3" in gestures
     after_duration, _ = _footer_lines(
         replace(

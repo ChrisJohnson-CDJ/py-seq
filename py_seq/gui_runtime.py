@@ -105,9 +105,9 @@ class GuiSnapshot:
     reset_mode: str = "OFF"
     reset_interval_beats: float | None = None
     recording_start_beat_count: int | None = None
-    recording_stop_beat_count: int | None = None
     recording_start_gesture_count: int | None = None
     recording_stop_gesture_count: int | None = None
+    recording_stop_gesture_cycle: bool = False
     recording_stop_after_ticks: int | None = None
 
 
@@ -454,9 +454,9 @@ class FourChannelGuiRuntime:
                 stop_mode=command.stop_mode,
                 reference_channel=command.reference_channel,
                 start_beat_count=command.start_beat_count,
-                stop_beat_count=command.stop_beat_count,
                 start_gesture_count=command.start_gesture_count,
                 stop_gesture_count=command.stop_gesture_count,
+                stop_gesture_cycle=command.stop_gesture_cycle,
                 stop_after_ticks=command.stop_after_ticks,
             )
             return
@@ -636,9 +636,9 @@ class FourChannelGuiRuntime:
             reset_mode=self.session.reset_mode.name,
             reset_interval_beats=self.session.reset_interval_beats,
             recording_start_beat_count=self.session.start_beat_count,
-            recording_stop_beat_count=self.session.stop_beat_count,
             recording_start_gesture_count=self.session.start_gesture_count,
             recording_stop_gesture_count=self.session.stop_gesture_count,
+            recording_stop_gesture_cycle=self.session.stop_gesture_cycle,
             recording_stop_after_ticks=self.session.stop_after_ticks,
         )
 
@@ -737,8 +737,6 @@ class FourChannelGuiRuntime:
             stop_mode = self.session.stop_mode.name
             if self.session.start_beat_count is not None:
                 start_mode += f" {self.session.start_beat_count}"
-            if self.session.stop_beat_count is not None:
-                stop_mode += f" {self.session.stop_beat_count}"
             if self.session.stop_after_ticks is not None:
                 stop_mode += (
                     f" {self.session.stop_after_ticks / TICKS_PER_BEAT:g}"
@@ -747,6 +745,8 @@ class FourChannelGuiRuntime:
                 start_mode += f" {self.session.start_gesture_count}"
             if self.session.stop_gesture_count is not None:
                 stop_mode += f" {self.session.stop_gesture_count}"
+            if self.session.stop_gesture_cycle:
+                stop_mode += " CYCLE"
             return (
                 f"Start {start_mode}; stop {stop_mode}"
             )

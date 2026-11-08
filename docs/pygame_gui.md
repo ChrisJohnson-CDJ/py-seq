@@ -40,6 +40,7 @@ Press **Esc**, type a command, and press **Enter**.
 | `stop beat` | Stop at the next eligible global beat boundary |
 | `stop after {beats}[+{n}[/{m}]]` | Stop after this duration from recording start |
 | `stop gesture [N]` | Automatically stop after the next or `N`th incoming gesture ends |
+| `stop gesture [N] cycle` / `stop gesture [N] cyc` | Record through the `N`th gesture end, then stop at the next incoming gesture start |
 | `stop loop` | Stop at the next wrap of the reference channel |
 | `reference N` | Select reference channel `1`-`4` for loop-synchronized start/stop |
 | `reset off` | Disable automatic resets without changing position |
@@ -71,8 +72,12 @@ start. Gesture stops count incoming `VOICE_END` events after recording starts,
 including ends from gestures that were already in progress. The start and stop
 counters are independent, so the gesture that triggers a start may also
 produce the first counted end. `VOICE_CHANGE` events never affect either
-counter. A gesture stop automatically disarms recording on its Nth end. Enter
-can still stop recording manually before the configured count is reached.
+counter. A normal gesture stop automatically disarms recording on its Nth end.
+With `cycle` (or `cyc`), the Nth end completes the recorded gesture but
+recording continues through the following silence; the next incoming gesture
+start commits the tape at its onset without recording that gesture. The start
+still passes through live MIDI articulation. Enter immediately commits and
+disarms recording, including while waiting for the cycle-closing start.
 
 Beat reset intervals accept a whole beat count and an optional binary fraction,
 for example `reset beat 3+3/8`; `reset beat` and `reset beat 1` both mean every
@@ -105,8 +110,9 @@ Recording status is shown as `IDLE`, `WAITING_START`, `RECORDING`, or
 selected start trigger. Beat- and loop-synchronized stops continue recording
 until their boundary. `stop after` counts from the actual recording start tick
 without beat alignment. Gesture-synchronized stops automatically disarm after
-the configured number of incoming gesture ends. The gesture that triggers a
-start is included from its onset. MIDI input remains available for live audition.
+the configured number of incoming gesture ends, or at the next incoming start
+when cycle mode is enabled. The gesture that triggers a start is included from
+its onset. MIDI input remains available for live audition.
 
 An empty channel's first recording window defines its loop length. Waiting
 time before a synchronized start is excluded. Overdub adds recorded notes to
