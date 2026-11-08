@@ -2,6 +2,8 @@
 
 A four-channel MIDI looper with independent loops and a Pygame interface.
 
+<img width="1025" height="630" alt="screenshot" src="./docs/assets/screenshot.jpg" />
+
 ## Current behavior
 
 - Shared monotonic transport with independent four-channel loop lengths/phases
