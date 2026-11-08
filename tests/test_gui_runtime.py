@@ -303,6 +303,80 @@ def test_runtime_applies_sync_configuration_and_reports_armed_state():
         runtime.close()
 
 
+def test_runtime_applies_counted_recording_and_fractional_reset_configuration():
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+    runtime.start()
+    try:
+        runtime.submit(
+            GuiIntentKind.RECORDING_SYNC,
+            value="start beat 3",
+        )
+        notification = wait_for_notification(runtime, "command_applied")
+        assert notification.message == "Start NEXT_BEAT 3; stop IMMEDIATE"
+        assert runtime.get_snapshot().recording_start_beat_count == 3
+
+        runtime.submit(
+            GuiIntentKind.RESET_CONFIG,
+            value="reset beat 3+3/8",
+        )
+        wait_for_notification(runtime, "command_applied")
+        snapshot = runtime.get_snapshot()
+        assert snapshot.reset_mode == ResetMode.BEAT.name
+        assert snapshot.reset_interval_beats == 3.375
+        assert session.reset_interval_beats == 3.375
+    finally:
+        runtime.close()
+
+
+def test_runtime_applies_stop_after_and_publishes_duration():
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+    runtime.start()
+    try:
+        runtime.submit(
+            GuiIntentKind.RECORDING_SYNC,
+            value="stop after 4+3/8",
+        )
+        notification = wait_for_notification(runtime, "command_applied")
+
+        assert notification.message == "Start IMMEDIATE; stop AFTER_DURATION 4.375"
+        assert (
+            runtime.get_snapshot().recording_stop_after_ticks
+            == 4 * 960 + 3 * 960 // 8
+        )
+    finally:
+        runtime.close()
+
+
+def test_runtime_applies_counted_gesture_sync_and_publishes_snapshot():
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+    runtime.start()
+    try:
+        runtime.submit(
+            GuiIntentKind.RECORDING_SYNC,
+            value="start gesture 3",
+        )
+        notification = wait_for_notification(runtime, "command_applied")
+
+        assert notification.message == "Start NEXT_GESTURE 3; stop IMMEDIATE"
+        assert runtime.get_snapshot().recording_start_gesture_count == 3
+
+        runtime.submit(
+            GuiIntentKind.RECORDING_SYNC,
+            value="stop gesture",
+        )
+        notification = wait_for_notification(runtime, "command_applied")
+
+        assert notification.message == "Start NEXT_GESTURE 3; stop NEXT_GESTURE 1"
+        snapshot = runtime.get_snapshot()
+        assert snapshot.recording_start_gesture_count == 3
+        assert snapshot.recording_stop_gesture_count == 1
+    finally:
+        runtime.close()
+
+
 def test_runtime_reports_self_reference_arm_as_an_error():
     session, _ = make_session()
     runtime = FourChannelGuiRuntime(session)
@@ -337,7 +411,7 @@ def test_runtime_reports_self_reference_arm_as_an_error():
 
 def test_runtime_reset_intents_preserve_automatic_mode_and_publish_musical_position():
     session, _ = make_session()
-    runtime = FourChannelGuiRuntime(session)
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
     runtime.start()
     try:
         runtime.submit(
@@ -363,6 +437,30 @@ def test_runtime_reset_intents_preserve_automatic_mode_and_publish_musical_posit
             0,
         )
         assert snapshot.transport.playing
+    finally:
+        runtime.close()
+
+
+def test_runtime_loop_length_command_updates_only_its_channel():
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+    runtime.start()
+    try:
+        runtime.submit(
+            GuiIntentKind.LOOP_LENGTH,
+            channel_id="channel-2",
+            value="length 3+3/8",
+        )
+        notification = wait_for_notification(runtime, "command_applied")
+
+        assert notification.message == "Loop length set to 3240 ticks"
+        snapshot = runtime.get_snapshot()
+        assert tuple(channel.loop_length_ticks for channel in snapshot.channels) == (
+            3840,
+            3240,
+            5760,
+            6720,
+        )
     finally:
         runtime.close()
 

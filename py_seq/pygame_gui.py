@@ -21,7 +21,11 @@ from .four_channel_session import (
     FourChannelSession,
     MidiRoute,
 )
-from .recording_commands import parse_recording_sync_command, parse_reset_command
+from .recording_commands import (
+    parse_length_command,
+    parse_recording_sync_command,
+    parse_reset_command,
+)
 from .gui_runtime import (
     FourChannelGuiRuntime,
     GuiChannelSnapshot,
@@ -55,8 +59,9 @@ _PROGRAM_COMMAND = re.compile(r"[pP](\d{3})(?::(\d{3}))?\Z")
 _RECORDING_MODE_LABELS = {
     "IMMEDIATE": "NOW",
     "NEXT_BEAT": "BEAT",
+    "AFTER_DURATION": "AFTER",
+    "NEXT_GESTURE": "GESTURE",
     "NEXT_REFERENCE_LOOP_START": "LOOP",
-    "FIRST_NOTE_ONSET": "NOTE",
 }
 logger = logging.getLogger(__name__)
 
@@ -124,6 +129,19 @@ def _footer_lines(
     stop_mode = _RECORDING_MODE_LABELS.get(
         snapshot.recording_stop_mode, snapshot.recording_stop_mode
     )
+    if snapshot.recording_start_beat_count is not None:
+        start_mode = f"{start_mode} {snapshot.recording_start_beat_count}"
+    if snapshot.recording_stop_beat_count is not None:
+        stop_mode = f"{stop_mode} {snapshot.recording_stop_beat_count}"
+    if snapshot.recording_stop_after_ticks is not None:
+        stop_mode = (
+            f"{stop_mode} "
+            f"{snapshot.recording_stop_after_ticks / TICKS_PER_BEAT:g}"
+        )
+    if snapshot.recording_start_gesture_count is not None:
+        start_mode = f"{start_mode} {snapshot.recording_start_gesture_count}"
+    if snapshot.recording_stop_gesture_count is not None:
+        stop_mode = f"{stop_mode} {snapshot.recording_stop_gesture_count}"
     configuration = (
         f"BEAT {_format_beat_position(display_beats)}  REC {snapshot.recording_state}  "
         f"START {start_mode}  STOP {stop_mode}  REF {reference}  "
@@ -135,7 +153,9 @@ def _footer_lines(
 
 def _reset_mode_label(snapshot: GuiSnapshot) -> str:
     if snapshot.reset_mode == "BEAT":
-        return f"BEAT {snapshot.reset_interval_beats}"
+        if snapshot.reset_interval_beats is None:
+            return "BEAT"
+        return f"BEAT {snapshot.reset_interval_beats:g}"
     return snapshot.reset_mode
 
 
@@ -803,6 +823,19 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                     parse_reset_command(command_text)
                                     submit_projected(
                                         GuiIntentKind.RESET_CONFIG,
+                                        value=command_text,
+                                    )
+                                elif command_word == "length":
+                                    parse_length_command(command_text)
+                                    selected = projected.get(
+                                        "selected_channel_id",
+                                        snapshot.selected_channel_id,
+                                    )
+                                    if not isinstance(selected, str):
+                                        selected = snapshot.selected_channel_id
+                                    submit_projected(
+                                        GuiIntentKind.LOOP_LENGTH,
+                                        channel_id=selected,
                                         value=command_text,
                                     )
                                 elif command_word in ("start", "stop", "reference"):

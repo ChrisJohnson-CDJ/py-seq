@@ -159,6 +159,64 @@ def test_clear_nonempty_loop_retains_length_then_empty_loop_resets_length():
     assert session.schedulers[0].running
     session.close()
 
+
+def test_set_loop_length_resizes_only_empty_channel_and_preserves_phase_origin():
+    session, _ = make_session((100, 200, 300, 400))
+    session.reset(50)
+    session.advance(100)
+
+    session.set_loop_length(0, 3900)
+
+    assert session.tape(0).length_ticks == 3900
+    assert session.tape(0).revision == 1
+    assert tuple(session.tape(index).length_ticks for index in range(1, 4)) == (
+        200,
+        300,
+        400,
+    )
+    assert session.current_tick == 100
+    assert session.phase_origin_tick(0) == 50
+    assert session.recorder(0).phase_origin_tick == 50
+    assert session.schedulers[0].phase_origin_tick == 50
+    assert tuple(session.phase_origin_tick(index) for index in range(1, 4)) == (
+        50,
+        50,
+        50,
+    )
+    session.close()
+
+
+def test_set_loop_length_rejects_unsupported_changes_without_mutation():
+    occupied, _ = make_session((100, 0, 0, 0))
+    occupied.tape(0).insert(IntervalInsert(10, 20, 60, 90, 1))
+    with pytest.raises(ValueError, match="empty channel"):
+        occupied.set_loop_length(0, 200)
+    assert occupied.tape(0).length_ticks == 100
+    assert occupied.phase_origin_tick(0) == 0
+    occupied.close()
+
+    running, _ = make_session((0, 0, 0, 0))
+    running.toggle_transport()
+    with pytest.raises(RuntimeError, match="transport is stopped"):
+        running.set_loop_length(0, 200)
+    assert running.tape(0).length_ticks == 0
+    running.close()
+
+    recording, _ = make_session((0, 0, 0, 0))
+    recording.set_recording_armed(True)
+    with pytest.raises(RuntimeError, match="recording"):
+        recording.set_loop_length(0, 200)
+    assert recording.tape(0).length_ticks == 0
+    recording.set_recording_armed(False)
+    recording.configure_recording_sync(start_mode=RecordingStartMode.NEXT_BEAT)
+    recording.set_recording_armed(True)
+    assert recording.recording_state is RecordingState.WAITING_START
+    with pytest.raises(RuntimeError, match="recording"):
+        recording.set_loop_length(0, 200)
+    assert recording.tape(0).length_ticks == 0
+    recording.close()
+
+
 def test_synchronized_start_excludes_waiting_time_and_captures_held_voice_at_zero():
     session, sinks = make_session((0, 0, 0, 0))
     session.toggle_transport()
@@ -204,11 +262,11 @@ def test_waiting_start_does_not_apply_overwrite_silence_early():
     session.toggle_recording()
     session.close()
 
-def test_first_note_start_records_triggering_gesture_once():
+def test_gesture_start_records_triggering_gesture_once():
     session, sinks = make_session((0, 0, 0, 0))
     session.toggle_transport()
     session.configure_recording_sync(
-        start_mode=RecordingStartMode.FIRST_NOTE_ONSET
+        start_mode=RecordingStartMode.NEXT_GESTURE
     )
     session.set_recording_armed(True)
     session.process_midi_message(
@@ -224,6 +282,452 @@ def test_first_note_start_records_triggering_gesture_once():
     assert session.tape(0).length_ticks == 40
     assert (interval.start, interval.duration, interval.pitch) == (0, 40, 67)
     session.close()
+
+
+@pytest.mark.parametrize("gesture_count", (1, 2, 4))
+def test_gesture_start_accepts_first_second_and_nth_gesture(gesture_count):
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_GESTURE,
+        start_gesture_count=gesture_count,
+    )
+    session.set_recording_armed(True)
+
+    for gesture_index in range(gesture_count):
+        start_tick = 10 + gesture_index * 20
+        session.process_midi_message(
+            mido.Message(
+                "note_on", channel=0, note=60 + gesture_index, velocity=90
+            ),
+            start_tick,
+        )
+        if gesture_index < gesture_count - 1:
+            assert session.recording_state is RecordingState.WAITING_START
+        else:
+            assert session.recording_state is RecordingState.RECORDING
+        session.process_midi_message(
+            mido.Message(
+                "note_off", channel=0, note=60 + gesture_index, velocity=0
+            ),
+            start_tick + 10,
+        )
+
+    session.set_recording_armed(False)
+    interval, = session.tape(0).intervals()
+    assert session.phase_origin_tick(0) == 10 + (gesture_count - 1) * 20
+    assert (interval.start, interval.duration) == (0, 10)
+    session.close()
+
+
+def test_counted_gesture_start_includes_trigger_and_ignores_voice_changes():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_GESTURE,
+        start_gesture_count=2,
+    )
+    session.set_recording_armed(True)
+
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 10
+    )
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=62, velocity=90), 15
+    )
+    assert session.recording_state is RecordingState.WAITING_START
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0), 20
+    )
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=62, velocity=0), 25
+    )
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=64, velocity=90), 30
+    )
+    assert session.recording_state is RecordingState.RECORDING
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=64, velocity=0), 50
+    )
+    session.set_recording_armed(False)
+
+    interval, = session.tape(0).intervals()
+    assert session.phase_origin_tick(0) == 30
+    assert session.tape(0).length_ticks == 20
+    assert (interval.start, interval.duration, interval.pitch) == (0, 20, 64)
+    session.close()
+
+
+def test_gesture_start_ignores_gesture_already_active_when_armed():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 10
+    )
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_GESTURE
+    )
+    session.set_recording_armed(True)
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=62, velocity=90), 15
+    )
+    assert session.recording_state is RecordingState.WAITING_START
+
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0), 20
+    )
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=62, velocity=0), 25
+    )
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=64, velocity=90), 30
+    )
+    assert session.recording_state is RecordingState.RECORDING
+    session.set_recording_armed(False)
+    session.close()
+
+
+def test_counted_gesture_stop_automatically_stops_on_nth_voice_end():
+    session, sinks = make_session((0, 1000, 0, 0))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.NEXT_GESTURE,
+        stop_gesture_count=2,
+    )
+    session.set_recording_armed(True)
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 10
+    )
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0), 20
+    )
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=62, velocity=90), 30
+    )
+    assert session.recording_state is RecordingState.RECORDING
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=62, velocity=0), 40
+    )
+
+    assert session.recording_state is RecordingState.IDLE
+    assert tuple(
+        (interval.start, interval.duration, interval.pitch)
+        for interval in session.tape(0).intervals()
+    ) == ((10, 10, 60), (30, 10, 62))
+    assert session.tape(0).length_ticks == 40
+    assert not session.record_armed
+    assert [
+        (message.type, message.note)
+        for message in sinks[0].messages
+        if message.type in ("note_on", "note_off")
+    ] == [
+        ("note_on", 60),
+        ("note_off", 60),
+        ("note_on", 62),
+        ("note_off", 62),
+    ]
+    session.close()
+
+
+@pytest.mark.parametrize("gesture_count", (1, 2, 4))
+def test_gesture_stop_counts_complete_gestures(gesture_count):
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.NEXT_GESTURE,
+        stop_gesture_count=gesture_count,
+    )
+    session.set_recording_armed(True)
+
+    for gesture_index in range(gesture_count):
+        start_tick = 10 + gesture_index * 20
+        session.process_midi_message(
+            mido.Message(
+                "note_on", channel=0, note=60 + gesture_index, velocity=90
+            ),
+            start_tick,
+        )
+        session.process_midi_message(
+            mido.Message(
+                "note_off", channel=0, note=60 + gesture_index, velocity=0
+            ),
+            start_tick + 10,
+        )
+        expected_state = (
+            RecordingState.IDLE
+            if gesture_index == gesture_count - 1
+            else RecordingState.RECORDING
+        )
+        assert session.recording_state is expected_state
+    session.close()
+
+
+def test_gesture_active_before_recording_activation_counts_on_voice_end():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.NEXT_GESTURE
+    )
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 10
+    )
+    session.set_recording_armed(True)
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0), 20
+    )
+
+    assert session.recording_state is RecordingState.IDLE
+    session.close()
+
+
+def test_immediate_gesture_stop_counts_voice_ends_while_transport_is_stopped():
+    session, _ = make_session((0, 0, 0, 0))
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.NEXT_GESTURE,
+        stop_gesture_count=2,
+    )
+    session.set_recording_armed(True)
+
+    for gesture_index in range(2):
+        start_tick = 10 + gesture_index * 20
+        session.process_midi_message(
+            mido.Message(
+                "note_on", channel=0, note=60 + gesture_index, velocity=90
+            ),
+            start_tick,
+        )
+        session.process_midi_message(
+            mido.Message(
+                "note_off", channel=0, note=60 + gesture_index, velocity=0
+            ),
+            start_tick + 10,
+        )
+
+    assert session.recording_state is RecordingState.IDLE
+    assert not session.record_armed
+    session.close()
+
+
+def test_start_trigger_gesture_counts_toward_gesture_stop():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_GESTURE,
+        stop_mode=RecordingStopMode.NEXT_GESTURE,
+        stop_gesture_count=2,
+    )
+    session.set_recording_armed(True)
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 10
+    )
+    assert session.recording_state is RecordingState.RECORDING
+
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0), 20
+    )
+    assert session.recording_state is RecordingState.RECORDING
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=62, velocity=90), 30
+    )
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=62, velocity=0), 40
+    )
+
+    assert session.recording_state is RecordingState.IDLE
+    assert tuple(
+        (interval.start, interval.duration, interval.pitch)
+        for interval in session.tape(0).intervals()
+    ) == ((0, 10, 60), (20, 10, 62))
+    session.close()
+
+
+def test_start_trigger_counts_toward_gesture_stop_without_manual_request():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_GESTURE,
+        stop_mode=RecordingStopMode.NEXT_GESTURE,
+        stop_gesture_count=1,
+    )
+    session.set_recording_armed(True)
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 10
+    )
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0), 20
+    )
+
+    assert session.recording_state is RecordingState.IDLE
+    session.close()
+
+
+def test_gesture_stop_counts_voice_end_once_after_voice_changes():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.NEXT_GESTURE
+    )
+    session.set_recording_armed(True)
+
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 10
+    )
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=62, velocity=90), 15
+    )
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=62, velocity=0), 20
+    )
+    assert session.recording_state is RecordingState.RECORDING
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0), 30
+    )
+
+    assert session.recording_state is RecordingState.IDLE
+    assert tuple(
+        (interval.start, interval.duration, interval.pitch)
+        for interval in session.tape(0).intervals()
+    ) == ((10, 5, 60), (15, 5, 62), (20, 10, 60))
+    session.close()
+
+
+def test_beat_start_can_stop_after_a_complete_gesture():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_BEAT,
+        stop_mode=RecordingStopMode.NEXT_GESTURE,
+    )
+    session.set_recording_armed(True)
+    session.advance(TICKS_PER_BEAT)
+
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90),
+        TICKS_PER_BEAT + 10,
+    )
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0),
+        TICKS_PER_BEAT + 20,
+    )
+
+    assert session.recording_state is RecordingState.IDLE
+    assert session.tape(0).length_ticks == 20
+    session.close()
+
+
+def test_gesture_end_started_before_beat_recording_activation_counts():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_BEAT,
+        stop_mode=RecordingStopMode.NEXT_GESTURE,
+    )
+    session.set_recording_armed(True)
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 10
+    )
+    session.advance(TICKS_PER_BEAT)
+    assert session.recording_state is RecordingState.RECORDING
+
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0),
+        TICKS_PER_BEAT + 10,
+    )
+
+    assert session.recording_state is RecordingState.IDLE
+    interval, = session.tape(0).intervals()
+    assert (interval.start, interval.duration, interval.pitch) == (0, 10, 60)
+    session.close()
+
+
+def test_gesture_start_can_stop_at_reference_loop_boundary():
+    session, _ = make_session((0, 960, 0, 0))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_GESTURE,
+        stop_mode=RecordingStopMode.NEXT_REFERENCE_LOOP_START,
+        reference_channel=1,
+    )
+    session.set_recording_armed(True)
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 10
+    )
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0), 20
+    )
+    session.request_recording_stop()
+    session.advance(959)
+    assert session.recording_state is RecordingState.WAITING_STOP
+
+    session.advance(960)
+
+    assert session.recording_state is RecordingState.IDLE
+    session.close()
+
+
+def test_reference_loop_start_can_stop_after_a_complete_gesture():
+    session, _ = make_session((0, 960, 0, 0))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_REFERENCE_LOOP_START,
+        stop_mode=RecordingStopMode.NEXT_GESTURE,
+        reference_channel=1,
+    )
+    session.set_recording_armed(True)
+    session.advance(960)
+    assert session.recording_state is RecordingState.RECORDING
+
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 970
+    )
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0), 980
+    )
+
+    assert session.recording_state is RecordingState.IDLE
+    session.close()
+
+
+def test_gesture_stop_completes_after_recorded_gesture_crosses_loop_boundary():
+    session, _ = make_session((100, 960, 0, 0))
+    session.toggle_transport()
+    session.advance(80)
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.NEXT_GESTURE
+    )
+    session.set_recording_armed(True)
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 90
+    )
+    session.advance(109)
+    assert session.recording_state is RecordingState.RECORDING
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0), 110
+    )
+
+    assert session.recording_state is RecordingState.IDLE
+    assert sum(
+        interval.duration for interval in session.tape(0).intervals()
+    ) == 20
+    session.close()
+
+
+def test_playback_onsets_do_not_count_as_recording_gestures():
+    session, _ = make_session((0, 1000, 0, 0))
+    session.tape(1).insert(IntervalInsert(10, 10, 60, 90, 1))
+    session.toggle_transport()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_GESTURE
+    )
+    session.set_recording_armed(True)
+
+    session.advance(10)
+
+    assert session.recording_state is RecordingState.WAITING_START
+    assert session.tape(1).intervals()
+    session.set_recording_armed(False)
+    session.close()
+
 
 def test_synchronized_stop_closes_held_recording_at_boundary_without_silencing_live_voice():
     session, sinks = make_session((0, 1000, 0, 0))
@@ -350,6 +854,261 @@ def test_request_on_exact_beat_waits_for_the_next_occurrence():
     assert session.phase_origin_tick(0) == 2 * TICKS_PER_BEAT
     session.set_recording_armed(False)
     session.close()
+
+
+def test_counted_start_beat_aligns_then_waits_complete_beats():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.advance(2 * TICKS_PER_BEAT + 400)
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_BEAT,
+        start_beat_count=2,
+    )
+    session.set_recording_armed(True)
+
+    trigger_tick = 5 * TICKS_PER_BEAT
+    session.advance(trigger_tick - 1)
+    assert session.recording_state is RecordingState.WAITING_START
+    session.advance(trigger_tick)
+
+    assert session.recording_state is RecordingState.RECORDING
+    assert session.phase_origin_tick(0) == trigger_tick
+    session.set_recording_armed(False)
+    session.close()
+
+
+def test_counted_stop_beat_uses_independent_alignment_after_recording():
+    session, _ = make_session((0, 1000, 0, 0))
+    session.toggle_transport()
+    session.advance(2 * TICKS_PER_BEAT + 400)
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.IMMEDIATE,
+        stop_mode=RecordingStopMode.NEXT_BEAT,
+        stop_beat_count=2,
+    )
+    session.set_recording_armed(True)
+    session.request_recording_stop()
+
+    trigger_tick = 5 * TICKS_PER_BEAT
+    session.advance(trigger_tick - 1)
+    assert session.recording_state is RecordingState.WAITING_STOP
+    session.advance(trigger_tick)
+
+    assert session.recording_state is RecordingState.IDLE
+    assert session.tape(0).length_ticks == trigger_tick - (2 * TICKS_PER_BEAT + 400)
+    session.close()
+
+
+def test_stop_after_measures_duration_from_actual_recording_start_tick():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.advance(137)
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.AFTER_DURATION,
+        stop_after_ticks=4 * TICKS_PER_BEAT,
+    )
+    session.set_recording_armed(True)
+    assert session.current_tick == 137
+    assert session.recording_state is RecordingState.RECORDING
+
+    session.advance(137 + 4 * TICKS_PER_BEAT - 1)
+    assert session.recording_state is RecordingState.RECORDING
+    session.advance(137 + 4 * TICKS_PER_BEAT)
+
+    assert session.recording_state is RecordingState.IDLE
+    assert session.tape(0).length_ticks == 4 * TICKS_PER_BEAT
+    session.close()
+
+
+def test_stop_after_fractional_duration_uses_exact_ticks():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.advance(137)
+    duration_ticks = 4 * TICKS_PER_BEAT + 3 * TICKS_PER_BEAT // 8
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.AFTER_DURATION,
+        stop_after_ticks=duration_ticks,
+    )
+    session.set_recording_armed(True)
+
+    session.advance(137 + duration_ticks - 1)
+    assert session.recording_state is RecordingState.RECORDING
+    session.advance(137 + duration_ticks)
+
+    assert session.recording_state is RecordingState.IDLE
+    assert session.tape(0).length_ticks == duration_ticks
+    session.close()
+
+
+def test_stop_after_reconfiguration_uses_original_recording_start_tick():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.advance(100)
+    session.set_recording_armed(True)
+    session.advance(110)
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.AFTER_DURATION,
+        stop_after_ticks=20,
+    )
+
+    session.advance(119)
+    assert session.recording_state is RecordingState.RECORDING
+    session.advance(120)
+
+    assert session.recording_state is RecordingState.IDLE
+    assert session.tape(0).length_ticks == 20
+    session.close()
+
+
+def test_stop_after_timer_starts_when_synchronized_recording_begins():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.advance(137)
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_BEAT,
+        stop_mode=RecordingStopMode.AFTER_DURATION,
+        stop_after_ticks=TICKS_PER_BEAT // 4,
+    )
+    session.set_recording_armed(True)
+
+    session.advance(TICKS_PER_BEAT - 1)
+    assert session.recording_state is RecordingState.WAITING_START
+    session.advance(TICKS_PER_BEAT)
+    assert session.recording_state is RecordingState.RECORDING
+
+    stop_tick = TICKS_PER_BEAT + TICKS_PER_BEAT // 4
+    session.advance(stop_tick - 1)
+    assert session.recording_state is RecordingState.RECORDING
+    session.advance(stop_tick)
+
+    assert session.recording_state is RecordingState.IDLE
+    assert session.tape(0).length_ticks == TICKS_PER_BEAT // 4
+    session.close()
+
+
+def test_stop_after_automatically_disarms_without_silencing_live_note():
+    session, sinks = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.advance(100)
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.AFTER_DURATION,
+        stop_after_ticks=20,
+    )
+    session.set_recording_armed(True)
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 110
+    )
+
+    session.advance(120)
+
+    assert session.recording_state is RecordingState.IDLE
+    assert not session.record_armed
+    assert session.articulators[0].live_voice is not None
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0), 130
+    )
+    assert session.articulators[0].live_voice is None
+    assert [
+        (message.type, message.note)
+        for message in sinks[0].messages
+        if message.type in ("note_on", "note_off")
+    ] == [("note_on", 60), ("note_off", 60)]
+    interval, = session.tape(0).intervals()
+    assert (interval.start, interval.duration, interval.pitch) == (10, 10, 60)
+    session.close()
+
+
+@pytest.mark.parametrize(
+    ("beat_count", "trigger_beat"),
+    [(None, 8), (1, 9), (2, 10)],
+)
+def test_stopped_unprocessed_boundary_aligns_counted_start(
+    beat_count, trigger_beat
+):
+    stopped, _ = make_session((0, 0, 0, 0))
+    stopped.advance(8 * TICKS_PER_BEAT)
+    stopped.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_BEAT,
+        start_beat_count=beat_count,
+    )
+    stopped.set_recording_armed(True)
+    stopped.toggle_transport()
+
+    trigger_tick = trigger_beat * TICKS_PER_BEAT
+    if beat_count is None:
+        assert stopped.recording_state is RecordingState.RECORDING
+    else:
+        assert stopped.recording_state is RecordingState.WAITING_START
+        stopped.advance(trigger_tick - 1)
+        assert stopped.recording_state is RecordingState.WAITING_START
+        stopped.advance(trigger_tick)
+        assert stopped.recording_state is RecordingState.RECORDING
+    assert stopped.phase_origin_tick(0) == trigger_tick
+    stopped.set_recording_armed(False)
+    stopped.close()
+
+
+def test_stopped_half_beat_excludes_partial_beat_from_counted_start():
+    session, _ = make_session((0, 0, 0, 0))
+    session.advance(8 * TICKS_PER_BEAT + TICKS_PER_BEAT // 2)
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_BEAT,
+        start_beat_count=1,
+    )
+    session.set_recording_armed(True)
+    session.toggle_transport()
+
+    trigger_tick = 10 * TICKS_PER_BEAT
+    session.advance(trigger_tick - 1)
+    assert session.recording_state is RecordingState.WAITING_START
+    session.advance(trigger_tick)
+    assert session.recording_state is RecordingState.RECORDING
+    assert session.phase_origin_tick(0) == trigger_tick
+    session.set_recording_armed(False)
+    session.close()
+
+
+def test_counted_start_pauses_while_transport_is_stopped():
+    session, _ = make_session((0, 0, 0, 0))
+    session.toggle_transport()
+    session.advance(200)
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_BEAT,
+        start_beat_count=2,
+    )
+    session.set_recording_armed(True)
+    scheduled_tick = 3 * TICKS_PER_BEAT
+
+    session.toggle_transport()
+    assert session.recording_state is RecordingState.WAITING_START
+    stopped_tick = session.current_tick
+    session.toggle_transport()
+    assert session.current_tick == stopped_tick
+    session.advance(scheduled_tick - 1)
+    assert session.recording_state is RecordingState.WAITING_START
+    session.advance(scheduled_tick)
+    assert session.recording_state is RecordingState.RECORDING
+    assert session.phase_origin_tick(0) == scheduled_tick
+    session.set_recording_armed(False)
+    session.close()
+
+
+def test_start_beat_does_not_repeat_a_boundary_processed_before_stop():
+    processed, _ = make_session((0, 0, 0, 0))
+    processed.toggle_transport()
+    processed.advance(8 * TICKS_PER_BEAT)
+    processed.toggle_transport()
+    processed.configure_recording_sync(start_mode=RecordingStartMode.NEXT_BEAT)
+    processed.set_recording_armed(True)
+    processed.toggle_transport()
+
+    assert processed.recording_state is RecordingState.WAITING_START
+    processed.advance(9 * TICKS_PER_BEAT - 1)
+    assert processed.recording_state is RecordingState.WAITING_START
+    processed.advance(9 * TICKS_PER_BEAT)
+    assert processed.recording_state is RecordingState.RECORDING
+    processed.set_recording_armed(False)
+    processed.close()
 
 def test_next_beat_boundary_is_not_missed_by_large_tick_advance():
     session, _ = make_session((0, 0, 0, 0))
@@ -720,22 +1479,71 @@ def test_recurring_beat_reset_survives_large_advances_and_transport_pause():
     session.close()
 
 
-def test_immediate_reset_restarts_beat_interval_without_replacing_its_mode():
+def test_manual_reset_does_not_restart_global_beat_reset_schedule():
     session, _ = make_session()
     session.configure_reset(ResetMode.BEAT, interval_beats=1)
     session.toggle_transport()
     session.advance(500)
     session.reset(500)
-    session.advance(1459)
+    session.advance(TICKS_PER_BEAT - 1)
 
-    assert session.musical_tick == 959
+    assert session.musical_tick == TICKS_PER_BEAT - 1 - 500
     assert session.reset_mode is ResetMode.BEAT
-    session.advance(1460)
+    session.advance(TICKS_PER_BEAT)
     assert session.musical_tick == 0
     assert session.reset_mode is ResetMode.BEAT
+    session.reset(1500)
+    session.advance(2 * TICKS_PER_BEAT - 1)
+    assert session.musical_tick == 2 * TICKS_PER_BEAT - 1 - 1500
+    session.advance(2 * TICKS_PER_BEAT)
+    assert session.musical_tick == 0
     session.configure_reset(ResetMode.OFF)
-    session.advance(2000)
-    assert session.musical_tick == 540
+    session.close()
+
+
+def test_fractional_beat_reset_uses_global_counter_multiples():
+    session, _ = make_session()
+    interval_ticks = 3 * TICKS_PER_BEAT + 3 * TICKS_PER_BEAT // 8
+    session.toggle_transport()
+    session.configure_reset(ResetMode.BEAT, interval_ticks=interval_ticks)
+
+    session.advance(interval_ticks - 1)
+    assert session.musical_tick == interval_ticks - 1
+    session.advance(interval_ticks)
+    assert session.musical_tick == 0
+    assert session.phase_origin_tick(0) == interval_ticks
+
+    session.advance(2 * interval_ticks)
+    assert session.musical_tick == 0
+    assert session.phase_origin_tick(0) == 2 * interval_ticks
+    session.close()
+
+
+def test_fractional_reset_alignment_uses_the_next_global_multiple():
+    session, _ = make_session()
+    interval_ticks = 3 * TICKS_PER_BEAT + 3 * TICKS_PER_BEAT // 8
+    session.toggle_transport()
+    session.advance(10 * TICKS_PER_BEAT + TICKS_PER_BEAT // 2)
+    session.configure_reset(ResetMode.BEAT, interval_ticks=interval_ticks)
+
+    next_multiple = 4 * interval_ticks
+    session.advance(next_multiple - 1)
+    assert session.musical_tick == next_multiple - 1
+    session.advance(next_multiple)
+    assert session.musical_tick == 0
+    assert session.phase_origin_tick(0) == next_multiple
+    session.close()
+
+
+def test_changing_reset_interval_selects_next_global_multiple_without_resetting():
+    session, _ = make_session()
+    session.toggle_transport()
+    session.advance(10 * TICKS_PER_BEAT + TICKS_PER_BEAT // 2)
+    session.configure_reset(ResetMode.BEAT, interval_ticks=4 * TICKS_PER_BEAT)
+    session.advance(12 * TICKS_PER_BEAT - 1)
+    assert session.musical_tick == 12 * TICKS_PER_BEAT - 1
+    session.advance(12 * TICKS_PER_BEAT)
+    assert session.musical_tick == 0
     session.close()
 
 

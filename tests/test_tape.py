@@ -119,6 +119,26 @@ def test_only_provisional_loops_can_grow_and_finalized_loops_cannot_resize():
         tape.truncate()
 
 
+def test_empty_tape_length_can_be_set_and_rejects_occupied_tapes():
+    tape = Tape(100)
+    tape.set_empty_length_ticks(240)
+    assert tape.length_ticks == 240
+    assert tape.revision == 1
+
+    tape.set_empty_length_ticks(240)
+    assert tape.revision == 1
+    tape.set_empty_length_ticks(0)
+    assert tape.length_ticks == 0
+    assert tape.revision == 2
+    tape.extend_length_ticks(10)
+
+    occupied = Tape(100)
+    insert(occupied, 10, 20)
+    with pytest.raises(ValueError, match="containing intervals"):
+        occupied.set_empty_length_ticks(200)
+    assert occupied.length_ticks == 100
+
+
 def test_circular_queries_are_half_open_unique_and_validate_arguments():
     tape = Tape(10)
     tail = insert(tape, 8, 2, gesture_id=2)

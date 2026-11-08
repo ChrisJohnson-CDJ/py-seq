@@ -328,6 +328,19 @@ class Tape:
             self._revision += 1
             self._length_provisional = True
 
+    def set_empty_length_ticks(self, length_ticks: int) -> None:
+        """Set an empty tape's loop length without changing its phase origin."""
+        _require_integer(length_ticks, "length_ticks")
+        if length_ticks < 0:
+            raise ValueError("length_ticks must be nonnegative")
+        if self._intervals:
+            raise ValueError("cannot change the length of a tape containing intervals")
+        if self._length_ticks == length_ticks:
+            return
+        self._length_ticks = length_ticks
+        self._length_provisional = length_ticks == 0
+        self._revision += 1
+
     def _validate_insertion(self, insertion: IntervalInsert) -> None:
         if not isinstance(insertion, IntervalInsert):
             raise TypeError("insertion must be an IntervalInsert")

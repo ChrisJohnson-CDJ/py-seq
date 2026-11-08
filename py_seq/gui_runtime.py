@@ -19,7 +19,11 @@ from .four_channel_session import (
     FourChannelSession,
     ResetMode,
 )
-from .recording_commands import parse_recording_sync_command, parse_reset_command
+from .recording_commands import (
+    parse_length_command,
+    parse_recording_sync_command,
+    parse_reset_command,
+)
 from tape import VoiceInterval
 
 logger = logging.getLogger(__name__)
@@ -35,6 +39,7 @@ class GuiIntentKind(Enum):
     RECORDING_SYNC = auto()
     RESET = auto()
     RESET_CONFIG = auto()
+    LOOP_LENGTH = auto()
     OVERWRITE = auto()
     CLEAR_TAPE = auto()
     PROGRAM = auto()
@@ -98,7 +103,12 @@ class GuiSnapshot:
     midi_input_overflow_count: int
     terminal_message: str | None = None
     reset_mode: str = "OFF"
-    reset_interval_beats: int | None = None
+    reset_interval_beats: float | None = None
+    recording_start_beat_count: int | None = None
+    recording_stop_beat_count: int | None = None
+    recording_start_gesture_count: int | None = None
+    recording_stop_gesture_count: int | None = None
+    recording_stop_after_ticks: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,6 +453,11 @@ class FourChannelGuiRuntime:
                 start_mode=command.start_mode,
                 stop_mode=command.stop_mode,
                 reference_channel=command.reference_channel,
+                start_beat_count=command.start_beat_count,
+                stop_beat_count=command.stop_beat_count,
+                start_gesture_count=command.start_gesture_count,
+                stop_gesture_count=command.stop_gesture_count,
+                stop_after_ticks=command.stop_after_ticks,
             )
             return
         if intent.kind is GuiIntentKind.RESET_CONFIG:
@@ -451,7 +466,16 @@ class FourChannelGuiRuntime:
             command = parse_reset_command(intent.value)
             self.session.configure_reset(
                 command.mode,
-                interval_beats=command.interval_beats,
+                interval_ticks=command.interval_ticks,
+            )
+            return
+        if intent.kind is GuiIntentKind.LOOP_LENGTH:
+            if not isinstance(intent.value, str):
+                raise TypeError("loop length command must be a string")
+            length_ticks = parse_length_command(intent.value)
+            self.session.set_loop_length(
+                self._channel_index(intent.channel_id),
+                length_ticks,
             )
             return
 
@@ -611,6 +635,11 @@ class FourChannelGuiRuntime:
             terminal_message=self._terminal_message,
             reset_mode=self.session.reset_mode.name,
             reset_interval_beats=self.session.reset_interval_beats,
+            recording_start_beat_count=self.session.start_beat_count,
+            recording_stop_beat_count=self.session.stop_beat_count,
+            recording_start_gesture_count=self.session.start_gesture_count,
+            recording_stop_gesture_count=self.session.stop_gesture_count,
+            recording_stop_after_ticks=self.session.stop_after_ticks,
         )
 
     def _channel_snapshot(self, index: int) -> GuiChannelSnapshot:
@@ -704,9 +733,22 @@ class FourChannelGuiRuntime:
         if intent.kind is GuiIntentKind.RECORDING_TOGGLE:
             return self.session.recording_state.name.replace("_", " ").title()
         if intent.kind is GuiIntentKind.RECORDING_SYNC:
+            start_mode = self.session.start_mode.name
+            stop_mode = self.session.stop_mode.name
+            if self.session.start_beat_count is not None:
+                start_mode += f" {self.session.start_beat_count}"
+            if self.session.stop_beat_count is not None:
+                stop_mode += f" {self.session.stop_beat_count}"
+            if self.session.stop_after_ticks is not None:
+                stop_mode += (
+                    f" {self.session.stop_after_ticks / TICKS_PER_BEAT:g}"
+                )
+            if self.session.start_gesture_count is not None:
+                start_mode += f" {self.session.start_gesture_count}"
+            if self.session.stop_gesture_count is not None:
+                stop_mode += f" {self.session.stop_gesture_count}"
             return (
-                f"Start {self.session.start_mode.name}; "
-                f"stop {self.session.stop_mode.name}"
+                f"Start {start_mode}; stop {stop_mode}"
             )
         if intent.kind is GuiIntentKind.RESET:
             return "Musical position reset"
@@ -714,11 +756,16 @@ class FourChannelGuiRuntime:
             if self.session.reset_mode is ResetMode.BEAT:
                 return (
                     "Automatic reset every "
-                    f"{self.session.reset_interval_beats} beats"
+                    f"{self.session.reset_interval_beats:g} beats"
                 )
             if self.session.reset_mode is ResetMode.LOOP:
                 return "Automatic reset at reference loop wraps"
             return "Automatic reset off"
+        if intent.kind is GuiIntentKind.LOOP_LENGTH:
+            length = self.session.tapes[
+                self._channel_index(intent.channel_id)
+            ].length_ticks
+            return f"Loop length set to {length} ticks"
         if intent.kind is GuiIntentKind.OVERWRITE:
             return "Overwrite enabled" if intent.value else "Overwrite disabled"
         if intent.kind is GuiIntentKind.CLEAR_TAPE:
@@ -755,6 +802,7 @@ class FourChannelGuiRuntime:
             GuiIntentKind.CLEAR_TAPE,
             GuiIntentKind.PROGRAM,
             GuiIntentKind.BANK_PROGRAM,
+            GuiIntentKind.LOOP_LENGTH,
         ) and intent.channel_id is None:
             raise ValueError(f"{intent.kind.name} requires a channel ID")
         if intent.kind in (
@@ -771,6 +819,10 @@ class FourChannelGuiRuntime:
             intent.value, str
         ):
             raise TypeError("RESET_CONFIG requires a command string")
+        if intent.kind is GuiIntentKind.LOOP_LENGTH and not isinstance(
+            intent.value, str
+        ):
+            raise TypeError("LOOP_LENGTH requires a command string")
         if intent.kind in (GuiIntentKind.PROGRAM, GuiIntentKind.BANK_PROGRAM):
             if isinstance(intent.value, bool) or not isinstance(intent.value, int):
                 raise TypeError(f"{intent.kind.name} requires an integer value")

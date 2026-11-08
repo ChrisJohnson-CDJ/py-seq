@@ -37,6 +37,8 @@ from py_seq.four_channel_session import (
 )
 from py_seq.gui_runtime import GuiNotification
 from py_seq.recording_commands import (
+    parse_length_command,
+    parse_musical_length,
     parse_recording_sync_command,
     parse_reset_command,
 )
@@ -166,14 +168,41 @@ def test_recording_sync_command_parser_supports_modes_and_reference_channel():
     assert parse_recording_sync_command(" start beat ") == parse_recording_sync_command(
         "START BEAT"
     )
-    assert (
-        parse_recording_sync_command("start note").start_mode
-        is RecordingStartMode.FIRST_NOTE_ONSET
-    )
+    with pytest.raises(ValueError, match="invalid start mode"):
+        parse_recording_sync_command("start note")
     assert (
         parse_recording_sync_command("stop loop").stop_mode
         is RecordingStopMode.NEXT_REFERENCE_LOOP_START
     )
+    assert parse_recording_sync_command("start beat 2").start_beat_count == 2
+    with pytest.raises(ValueError, match="stop beat"):
+        parse_recording_sync_command("stop beat 4")
+    assert (
+        parse_recording_sync_command("stop beat").stop_mode
+        is RecordingStopMode.NEXT_BEAT
+    )
+    assert (
+        parse_recording_sync_command("stop after 4").stop_after_ticks == 3840
+    )
+    assert (
+        parse_recording_sync_command("stop after 4+1").stop_after_ticks
+        == 3900
+    )
+    assert (
+        parse_recording_sync_command("stop after 4+3/8").stop_after_ticks
+        == 4200
+    )
+    assert (
+        parse_recording_sync_command("stop after 0+1/4").stop_after_ticks
+        == 240
+    )
+    assert (
+        parse_recording_sync_command("start gesture").start_gesture_count == 1
+    )
+    assert (
+        parse_recording_sync_command("stop gesture 3").stop_gesture_count == 3
+    )
+    assert parse_recording_sync_command("start beat").start_beat_count is None
     assert parse_recording_sync_command("reference 4").reference_channel == 3
 
     with pytest.raises(ValueError, match="between 1 and 4"):
@@ -184,27 +213,84 @@ def test_recording_sync_command_parser_supports_modes_and_reference_channel():
         parse_recording_sync_command("start bar")
     with pytest.raises(ValueError, match="invalid stop mode"):
         parse_recording_sync_command("stop bar")
+    for command in (
+        "start beat 0",
+        "stop beat -1",
+        "start beat 1.5",
+        "stop loop 2",
+        "stop after 0",
+        "stop after 0+1/3",
+        "stop after 4+16/16",
+        "stop after 4+1/128",
+        "stop after",
+        "start gesture 0",
+        "stop gesture 1.5",
+    ):
+        with pytest.raises(ValueError):
+            parse_recording_sync_command(command)
 
 
 def test_reset_command_parser_accepts_only_supported_modes_and_positive_beats():
     assert parse_reset_command("reset off").mode is ResetMode.OFF
     assert parse_reset_command("reset loop").mode is ResetMode.LOOP
+    assert parse_reset_command("reset beat").interval_ticks == 960
     beat_reset = parse_reset_command("reset beat 8")
     assert beat_reset.mode is ResetMode.BEAT
     assert beat_reset.interval_beats == 8
+    fractional_reset = parse_reset_command("reset beat 3+3/8")
+    assert fractional_reset.interval_ticks == 3240
+    assert fractional_reset.interval_beats == 3.375
+    exactly_representable_reset = parse_reset_command("reset beat 1+2/128")
+    assert exactly_representable_reset.interval_ticks == 975
 
     for command in (
         "reset",
-        "reset beat",
         "reset beat 0",
+        "reset beat 0+0",
         "reset beat -1",
         "reset beat 1.5",
+        "reset beat 1+1/3",
+        "reset beat 1+1/128",
+        "reset beat 1+1/256",
         "reset beat nope",
         "reset unknown",
         "reset loop extra",
     ):
         with pytest.raises(ValueError):
             parse_reset_command(command)
+
+
+@pytest.mark.parametrize(
+    ("expression", "ticks"),
+    [
+        ("4", 3840),
+        ("0", 0),
+        ("4+0", 3840),
+        ("4+1", 3900),
+        ("3+3/8", 3240),
+        ("0+1/64", 15),
+        ("2+1/2", 2400),
+    ],
+)
+def test_musical_length_parser_converts_supported_fractions_exactly(expression, ticks):
+    assert parse_musical_length(expression) == ticks
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ("", "-1", "1.5", "4+", "4+1/3", "4+1/128", "4+16/16", "4+0/0"),
+)
+def test_musical_length_parser_rejects_malformed_or_unsupported_expressions(expression):
+    with pytest.raises(ValueError):
+        parse_musical_length(expression)
+
+
+def test_length_command_requires_a_positive_length_and_exact_syntax():
+    assert parse_length_command(" LENGTH 3+3/8 ") == 3240
+
+    for command in ("length 0", "length 0+0", "length 2 3", "length -1", "3+1/2"):
+        with pytest.raises(ValueError):
+            parse_length_command(command)
 
 
 def test_transport_interpolation_is_visual_and_freezes_when_paused():
@@ -319,6 +405,50 @@ def test_gui_footer_keeps_recording_configuration_separate_from_status():
         "> start bar"
     )
 
+    counted, _ = _footer_lines(
+        replace(
+            snapshot,
+            recording_start_beat_count=2,
+            recording_stop_beat_count=3,
+            reset_mode="BEAT",
+            reset_interval_beats=3.375,
+        ),
+        1.0,
+        False,
+        "",
+        "",
+    )
+    assert "START BEAT 2" in counted
+    assert "STOP LOOP 3" in counted
+    assert "RESET BEAT 3.375" in counted
+    gestures, _ = _footer_lines(
+        replace(
+            snapshot,
+            recording_start_mode="NEXT_GESTURE",
+            recording_stop_mode="NEXT_GESTURE",
+            recording_start_gesture_count=2,
+            recording_stop_gesture_count=3,
+        ),
+        1.0,
+        False,
+        "",
+        "",
+    )
+    assert "START GESTURE 2" in gestures
+    assert "STOP GESTURE 3" in gestures
+    after_duration, _ = _footer_lines(
+        replace(
+            snapshot,
+            recording_stop_mode="AFTER_DURATION",
+            recording_stop_after_ticks=4 * 960 + 3 * 960 // 8,
+        ),
+        1.0,
+        False,
+        "",
+        "",
+    )
+    assert "STOP AFTER 4.375" in after_duration
+
 
 def test_recording_mode_labels_are_explicit_and_concise():
     snapshot = GuiSnapshot(
@@ -349,13 +479,13 @@ def test_recording_mode_labels_are_explicit_and_concise():
     assert "START NOW" in configuration
     assert "STOP LOOP" in configuration
     note_start, _ = _footer_lines(
-        replace(snapshot, recording_start_mode="FIRST_NOTE_ONSET"),
+        replace(snapshot, recording_start_mode="NEXT_GESTURE"),
         0,
         False,
         "",
         "",
     )
-    assert "START NOTE" in note_start
+    assert "START GESTURE" in note_start
 
 
 def test_beat_position_format_rounds_to_nearest_64th_and_carries():
