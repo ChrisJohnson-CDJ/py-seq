@@ -154,8 +154,8 @@ def parse_recording_sync_command(command: str) -> RecordingSyncCommand:
         or (len(parts) == 3 and parts[1] not in ("beat", "gesture"))
     ):
         raise ValueError(
-            "use 'start immediate|beat [N]|gesture [N]|loop', "
-            "'stop immediate|beat|after {beats}[+{n}[/{m}]]|gesture [N]|loop', "
+            "use 'start immediate|beat [N]|gesture [N]|loop|transport', "
+            "'stop immediate|beat|after {beats}[+{n}[/{m}]]|gesture [N]|loop|transport', "
             "or 'reference 1-4'"
         )
 
@@ -164,12 +164,14 @@ def parse_recording_sync_command(command: str) -> RecordingSyncCommand:
         "beat": RecordingStartMode.NEXT_BEAT,
         "gesture": RecordingStartMode.NEXT_GESTURE,
         "loop": RecordingStartMode.NEXT_REFERENCE_LOOP_START,
+        "transport": RecordingStartMode.MIDI_TRANSPORT,
     }
     stop_modes = {
         "immediate": RecordingStopMode.IMMEDIATE,
         "beat": RecordingStopMode.NEXT_BEAT,
         "gesture": RecordingStopMode.NEXT_GESTURE,
         "loop": RecordingStopMode.NEXT_REFERENCE_LOOP_START,
+        "transport": RecordingStopMode.MIDI_TRANSPORT,
     }
     beat_count = None
     gesture_count = 1 if parts[1] == "gesture" else None
@@ -193,9 +195,9 @@ def parse_recording_sync_command(command: str) -> RecordingSyncCommand:
             stop_gesture_count=gesture_count,
         )
     choices = (
-        "immediate|beat [N]|gesture [N]|loop"
+        "immediate|beat [N]|gesture [N]|loop|transport"
         if parts[0] == "start"
-        else "immediate|beat|after {beats}[+{n}[/{m}]]|gesture [N]|loop"
+        else "immediate|beat|after {beats}[+{n}[/{m}]]|gesture [N]|loop|transport"
     )
     raise ValueError(f"invalid {parts[0]} mode; choose {choices}")
 

@@ -62,6 +62,7 @@ _RECORDING_MODE_LABELS = {
     "AFTER_DURATION": "AFTER",
     "NEXT_GESTURE": "GESTURE",
     "NEXT_REFERENCE_LOOP_START": "LOOP",
+    "MIDI_TRANSPORT": "TRANSPORT",
 }
 logger = logging.getLogger(__name__)
 
@@ -490,13 +491,22 @@ def _draw_ui(
         PLAY if snapshot.transport.playing else SECONDARY,
         (150, 21),
     )
+    tempo_text = f"{snapshot.transport.tempo_bpm:g} BPM"
     _draw_text(
         screen,
-        f"{snapshot.transport.tempo_bpm:g} BPM",
+        tempo_text,
         fonts["small"],
         PRIMARY,
         (245, 21),
     )
+    midi_in_bpm = (
+        "---" if snapshot.midi_in_bpm is None else str(snapshot.midi_in_bpm)
+    )
+    midi_in_text = f"MIDI IN BPM {midi_in_bpm}"
+    if snapshot.midi_in_no_clock:
+        midi_in_text += " (no clock)"
+    midi_in_x = max(340, 245 + fonts["small"].size(tempo_text)[0] + 20)
+    _draw_text(screen, midi_in_text, fonts["small"], PRIMARY, (midi_in_x, 21))
     connected_outputs = sum(channel.output_connected for channel in snapshot.channels)
     input_state = "IN OK" if snapshot.input_connected else "IN --"
     output_state = f"OUT {connected_outputs}/{CHANNEL_COUNT}"
@@ -506,7 +516,11 @@ def _draw_ui(
     else:
         midi_status = f"MIDI {input_state}  {output_state}"
         status_color = PLAY
-    status_x = max(500, width - fonts["small"].size(midi_status)[0] - 25)
+    status_x = max(
+        midi_in_x + fonts["small"].size(midi_in_text)[0] + 20,
+        width - fonts["small"].size(midi_status)[0] - 25,
+    )
+    midi_status = _truncate_text(midi_status, fonts["small"], width - status_x - 20)
     _draw_text(screen, midi_status, fonts["small"], status_color, (status_x, 21))
     pygame.draw.line(screen, GRID, (20, 50), (width - 20, 50))
 
@@ -952,7 +966,8 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                 "WAITING_START": "IDLE",
                                 "RECORDING": (
                                     "IDLE"
-                                    if snapshot.recording_stop_mode == "IMMEDIATE"
+                                    if snapshot.recording_stop_mode
+                                    in ("IMMEDIATE", "MIDI_TRANSPORT")
                                     else "WAITING_STOP"
                                 ),
                                 "WAITING_STOP": "RECORDING",

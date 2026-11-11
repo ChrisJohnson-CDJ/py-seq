@@ -6,6 +6,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Protocol
@@ -29,6 +30,46 @@ from tape import VoiceInterval
 logger = logging.getLogger(__name__)
 
 _CHANNEL_IDS = tuple(f"channel-{index + 1}" for index in range(CHANNEL_COUNT))
+_MIDI_CLOCKS_PER_BEAT = 24
+_MIDI_CLOCK_AVERAGING_BEATS = 4
+_MIDI_CLOCK_TIMEOUT_NS = 2_000_000_000
+
+
+class _MidiClockTempo:
+    def __init__(self) -> None:
+        self._timestamps: deque[int] = deque(
+            maxlen=_MIDI_CLOCK_AVERAGING_BEATS * _MIDI_CLOCKS_PER_BEAT + 1
+        )
+        self._last_clock_ns: int | None = None
+        self.bpm: int | None = None
+
+    def observe(self, timestamp_ns: int) -> None:
+        if (
+            self._last_clock_ns is not None
+            and timestamp_ns - self._last_clock_ns >= _MIDI_CLOCK_TIMEOUT_NS
+        ):
+            self._timestamps.clear()
+        self._last_clock_ns = timestamp_ns
+        self._timestamps.append(timestamp_ns)
+        if len(self._timestamps) < self._timestamps.maxlen:
+            return
+        midpoint = _MIDI_CLOCK_AVERAGING_BEATS * _MIDI_CLOCKS_PER_BEAT // 2
+        first_half = self._timestamps[midpoint] - self._timestamps[0]
+        second_half = self._timestamps[-1] - self._timestamps[midpoint]
+        if first_half <= 0 or second_half <= 0:
+            return
+        if abs(first_half - second_half) * 20 > max(first_half, second_half):
+            return
+        duration_ns = first_half + second_half
+        numerator = _MIDI_CLOCK_AVERAGING_BEATS * 60_000_000_000
+        self.bpm = (numerator + duration_ns // 2) // duration_ns
+
+    def no_clock(self, now_ns: int) -> bool:
+        return (
+            self.bpm is not None
+            and self._last_clock_ns is not None
+            and now_ns - self._last_clock_ns >= _MIDI_CLOCK_TIMEOUT_NS
+        )
 
 
 class GuiIntentKind(Enum):
@@ -109,6 +150,8 @@ class GuiSnapshot:
     recording_stop_gesture_count: int | None = None
     recording_stop_gesture_cycle: bool = False
     recording_stop_after_ticks: int | None = None
+    midi_in_bpm: int | None = None
+    midi_in_no_clock: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +235,7 @@ class FourChannelGuiRuntime:
             for voice in self._live_voices
         ]
         self._clock_origin_ns = clock_ns()
+        self._midi_clock_tempo = _MidiClockTempo()
         self._tick_origin = session.current_tick
         self._transport_epoch = 0
         self._last_snapshot_ns = 0
@@ -371,6 +415,8 @@ class FourChannelGuiRuntime:
             tick = self._tick_at(timestamp_ns)
             if isinstance(item, mido.Message):
                 processed = True
+                if item.type == "clock":
+                    self._midi_clock_tempo.observe(timestamp_ns)
                 try:
                     self.session.process_midi_message(item, tick)
                 except Exception as error:
@@ -640,6 +686,8 @@ class FourChannelGuiRuntime:
             recording_stop_gesture_count=self.session.stop_gesture_count,
             recording_stop_gesture_cycle=self.session.stop_gesture_cycle,
             recording_stop_after_ticks=self.session.stop_after_ticks,
+            midi_in_bpm=self._midi_clock_tempo.bpm,
+            midi_in_no_clock=self._midi_clock_tempo.no_clock(now_ns),
         )
 
     def _channel_snapshot(self, index: int) -> GuiChannelSnapshot:

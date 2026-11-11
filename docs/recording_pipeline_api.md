@@ -81,8 +81,10 @@ configured threshold, and does not suppress incoming intervals. An
 `EraseRegion` represents overwrite silence.
 
 `FourChannelSession` supplies the application-level recording window: immediate,
-next-beat, reference-loop, or first-note start; and immediate, next-beat, or
-reference-loop stop. Waiting for a synchronized start does not capture notes.
+beat, reference-loop, gesture, or incoming MIDI transport start; and immediate,
+beat, duration, reference-loop, gesture, or incoming MIDI transport stop.
+Waiting for a synchronized start does not capture notes. MIDI transport
+messages only trigger recording; they do not control playback or timing.
 The Pygame guide describes those controls and the reference-channel rules.
 
 See [`tests/test_pre_processor.py`](../tests/test_pre_processor.py),

@@ -48,6 +48,194 @@ def make_session(
     return session, sinks
 
 
+def test_midi_transport_starts_and_commits_recording_at_message_ticks():
+    session, _ = make_session((0, 960, 960, 960))
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.MIDI_TRANSPORT,
+        stop_mode=RecordingStopMode.MIDI_TRANSPORT,
+    )
+    session.toggle_transport()
+    session.advance(20)
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("note_on", note=60, velocity=90), 30)
+    session.process_midi_message(mido.Message("note_off", note=60), 40)
+    session.process_midi_message(mido.Message.from_bytes([0xFA]), 100)
+    assert session.recording_state is RecordingState.RECORDING
+    assert session.phase_origin_tick(0) == 100
+    session.process_midi_message(mido.Message("note_on", note=62, velocity=90), 120)
+    session.process_midi_message(mido.Message("start"), 130)
+    session.process_midi_message(mido.Message.from_bytes([0xFC]), 160)
+
+    assert session.recording_state is RecordingState.IDLE
+    assert session.transport_running
+    assert session.tape(0).length_ticks == 60
+    (interval,) = session.tape(0).intervals()
+    assert (interval.start, interval.duration, interval.pitch) == (20, 40, 62)
+    session.close()
+
+
+def test_midi_start_works_while_playback_is_stopped_without_starting_playback():
+    session, _ = make_session()
+    session.configure_recording_sync(start_mode=RecordingStartMode.MIDI_TRANSPORT)
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("start"), 0)
+    assert session.recording_state is RecordingState.RECORDING
+    assert not session.transport_running
+    session.toggle_transport()
+    assert session.recording_state is RecordingState.RECORDING
+    session.close()
+
+
+def test_midi_stop_while_playback_is_stopped_does_not_start_playback():
+    session, _ = make_session()
+    session.configure_recording_sync(stop_mode=RecordingStopMode.MIDI_TRANSPORT)
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("stop"), 0)
+    assert session.recording_state is RecordingState.IDLE
+    assert not session.transport_running
+    session.close()
+
+
+def test_midi_start_and_beat_stop_are_independently_configurable():
+    session, _ = make_session()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.MIDI_TRANSPORT,
+        stop_mode=RecordingStopMode.NEXT_BEAT,
+    )
+    session.toggle_transport()
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("start"), 10)
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("stop"), 20)
+    assert session.recording_state is RecordingState.WAITING_STOP
+    session.advance(TICKS_PER_BEAT)
+    assert session.recording_state is RecordingState.IDLE
+    session.close()
+
+
+def test_beat_start_and_midi_stop_are_independently_configurable():
+    session, _ = make_session()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_BEAT,
+        stop_mode=RecordingStopMode.MIDI_TRANSPORT,
+    )
+    session.toggle_transport()
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("start"), 10)
+    assert session.recording_state is RecordingState.WAITING_START
+    session.advance(TICKS_PER_BEAT)
+    assert session.recording_state is RecordingState.RECORDING
+    session.process_midi_message(mido.Message("stop"), TICKS_PER_BEAT + 10)
+    assert session.recording_state is RecordingState.IDLE
+    session.close()
+
+
+def test_midi_start_waiting_across_playback_restart_and_enter_cancels():
+    session, _ = make_session()
+    session.configure_recording_sync(start_mode=RecordingStartMode.MIDI_TRANSPORT)
+    session.toggle_recording()
+    session.toggle_transport()
+    assert session.recording_state is RecordingState.WAITING_START
+    session.toggle_transport()
+    session.toggle_transport()
+    assert session.recording_state is RecordingState.WAITING_START
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("start"), 0)
+    assert session.recording_state is RecordingState.IDLE
+    assert not session.record_armed
+    session.close()
+
+
+def test_enter_commits_midi_stop_recording_immediately():
+    session, _ = make_session((0, 960, 960, 960))
+    session.configure_recording_sync(stop_mode=RecordingStopMode.MIDI_TRANSPORT)
+    session.toggle_transport()
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("note_on", note=60, velocity=90), 10)
+    session.advance(50)
+    session.toggle_recording()
+    assert session.recording_state is RecordingState.IDLE
+    assert session.tape(0).length_ticks == 50
+    (interval,) = session.tape(0).intervals()
+    assert (interval.start, interval.duration) == (10, 40)
+    session.close()
+
+
+@pytest.mark.parametrize("status", [0xF8, 0xFB, 0xFC])
+def test_other_realtime_messages_do_not_start_transport_recording(status):
+    session, _ = make_session()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.MIDI_TRANSPORT,
+        stop_mode=RecordingStopMode.MIDI_TRANSPORT,
+    )
+    session.toggle_transport()
+    session.toggle_recording()
+    session.process_midi_message(mido.Message.from_bytes([status]), 10)
+    assert session.recording_state is RecordingState.WAITING_START
+    session.process_midi_message(mido.Message("start"), 20)
+    if status != 0xFC:
+        session.process_midi_message(mido.Message.from_bytes([status]), 30)
+        assert session.recording_state is RecordingState.RECORDING
+    session.close()
+
+
+@pytest.mark.parametrize("stop_mode", [RecordingStopMode.IMMEDIATE, RecordingStopMode.NEXT_BEAT])
+def test_midi_stop_does_not_override_other_stop_modes(stop_mode):
+    session, _ = make_session()
+    session.configure_recording_sync(stop_mode=stop_mode)
+    session.toggle_transport()
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("stop"), 10)
+    assert session.recording_state is RecordingState.RECORDING
+    if stop_mode is RecordingStopMode.NEXT_BEAT:
+        session.toggle_recording()
+        session.process_midi_message(mido.Message("stop"), 20)
+        assert session.recording_state is RecordingState.WAITING_STOP
+    assert session.transport_running
+    session.close()
+
+
+def test_midi_start_does_not_override_another_start_mode():
+    session, _ = make_session()
+    session.configure_recording_sync(start_mode=RecordingStartMode.NEXT_GESTURE)
+    session.toggle_transport()
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("start"), 10)
+    assert session.recording_state is RecordingState.WAITING_START
+    session.process_midi_message(mido.Message("note_on", note=60, velocity=90), 20)
+    assert session.recording_state is RecordingState.RECORDING
+    session.close()
+
+
+def test_midi_stop_respects_stop_mode_changed_during_recording():
+    session, _ = make_session()
+    session.toggle_transport()
+    session.toggle_recording()
+    session.configure_recording_sync(stop_mode=RecordingStopMode.MIDI_TRANSPORT)
+    session.process_midi_message(mido.Message("stop"), 10)
+    assert session.recording_state is RecordingState.IDLE
+
+    session.toggle_recording()
+    session.configure_recording_sync(stop_mode=RecordingStopMode.NEXT_GESTURE)
+    session.process_midi_message(mido.Message("stop"), 20)
+    assert session.recording_state is RecordingState.RECORDING
+    session.close()
+
+
+def test_clearing_reference_does_not_cancel_transport_start():
+    session, _ = make_session((960, 960, 960, 960))
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.MIDI_TRANSPORT, reference_channel=1
+    )
+    session.toggle_transport()
+    session.toggle_recording()
+    session.clear_tape(1)
+    assert session.recording_state is RecordingState.WAITING_START
+    session.process_midi_message(mido.Message("start"), 10)
+    assert session.recording_state is RecordingState.RECORDING
+    session.close()
+
+
 def test_four_channel_coordinator_runs_all_loops_on_shared_transport():
     session, sinks = make_session((960, 1920, 2880, 3840))
     for index in range(4):

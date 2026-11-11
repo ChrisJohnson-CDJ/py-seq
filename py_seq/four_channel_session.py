@@ -24,6 +24,7 @@ class RecordingStartMode(Enum):
     NEXT_BEAT = auto()
     NEXT_GESTURE = auto()
     NEXT_REFERENCE_LOOP_START = auto()
+    MIDI_TRANSPORT = auto()
 
 
 class RecordingStopMode(Enum):
@@ -32,6 +33,7 @@ class RecordingStopMode(Enum):
     AFTER_DURATION = auto()
     NEXT_GESTURE = auto()
     NEXT_REFERENCE_LOOP_START = auto()
+    MIDI_TRANSPORT = auto()
 
 
 class RecordingState(Enum):
@@ -647,6 +649,7 @@ class FourChannelSession:
             RecordingStopMode.IMMEDIATE,
             RecordingStopMode.AFTER_DURATION,
             RecordingStopMode.NEXT_GESTURE,
+            RecordingStopMode.MIDI_TRANSPORT,
         ):
             self._finish_recording_window(self.current_tick)
             return
@@ -741,7 +744,11 @@ class FourChannelSession:
         channel = self._channel_index(channel)
         if (
             (
-                self._recording_state is RecordingState.WAITING_START
+                (
+                    self._recording_state is RecordingState.WAITING_START
+                    and self._start_mode
+                    is not RecordingStartMode.MIDI_TRANSPORT
+                )
                 or (
                     self._recording_state is RecordingState.WAITING_STOP
                     and not self._cycle_waiting_for_start
@@ -863,6 +870,18 @@ class FourChannelSession:
 
     def process_midi_message(self, message: mido.Message, tick: int) -> None:
         self.advance(tick)
+        if (
+            message.type == "start"
+            and self._recording_state is RecordingState.WAITING_START
+            and self._start_mode is RecordingStartMode.MIDI_TRANSPORT
+        ):
+            self._begin_recording_window(tick)
+        elif (
+            message.type == "stop"
+            and self._recording_state is RecordingState.RECORDING
+            and self._stop_mode is RecordingStopMode.MIDI_TRANSPORT
+        ):
+            self._finish_recording_window(tick)
         normalized_message = (
             message.copy(channel=0)
             if getattr(message, "type", None) in ("note_on", "note_off")
@@ -1009,7 +1028,10 @@ class FourChannelSession:
                 self._start_mode,
                 self._start_beat_count,
             )
-        elif self._start_mode is not RecordingStartMode.NEXT_GESTURE:
+        elif self._start_mode not in (
+            RecordingStartMode.NEXT_GESTURE,
+            RecordingStartMode.MIDI_TRANSPORT,
+        ):
             raise ValueError("start mode does not use a scheduled boundary")
 
     def _schedule_stop_boundary(self, tick: int) -> None:

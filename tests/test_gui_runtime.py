@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 import time
 
@@ -12,6 +13,7 @@ from py_seq.gui_runtime import (
     FourChannelGuiRuntime,
     GuiCommandQueueFull,
     GuiIntentKind,
+    _MidiClockTempo,
 )
 from tape import IntervalInsert
 
@@ -38,6 +40,176 @@ def make_session() -> tuple[
         MidiRoute("OUT4", 3, sinks[3], 3),
     )
     return FourChannelSession((3840, 4800, 5760, 6720), 120, routes), sinks
+
+
+@pytest.mark.parametrize(("tempo", "expected"), [(119.4, 119), (120.6, 121)])
+def test_midi_clock_tracks_whole_bpm_after_four_beats(tempo, expected):
+    estimate = _MidiClockTempo()
+    for index in range(96):
+        estimate.observe(round(index * 60_000_000_000 / (24 * tempo)))
+    assert estimate.bpm is None
+    estimate.observe(round(96 * 60_000_000_000 / (24 * tempo)))
+    assert estimate.bpm == expected
+    assert isinstance(estimate.bpm, int)
+
+
+def test_midi_clock_four_beat_average_suppresses_slow_callback_jitter():
+    estimate = _MidiClockTempo()
+    readings = []
+    two_beat_readings = []
+    timestamps = []
+    for index in range(193):
+        timestamp = round(
+            index * 500_000_000 / 24
+            + 12_000_000 * math.sin(2 * math.pi * index / 96)
+        )
+        timestamps.append(timestamp)
+        estimate.observe(timestamp)
+        if index >= 96:
+            readings.append(estimate.bpm)
+            two_beat_readings.append(
+                round(120_000_000_000 / (timestamp - timestamps[index - 48]))
+            )
+    assert readings == [120] * 97
+    assert min(two_beat_readings) < 120 < max(two_beat_readings)
+
+
+def test_midi_clock_estimate_uses_callback_timestamps_without_changing_transport():
+    now = [1_000_000_000]
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: now[0])
+
+    for index in range(97):
+        # Alternate callback jitter while keeping the four-beat duration exact.
+        now[0] = 1_000_000_000 + round(index * 500_000_000 / 24) + (
+            1_000_000 if index % 2 else 0
+        )
+        runtime.enqueue_midi_message(mido.Message("clock"))
+        if index == 95:
+            runtime._process_pending()
+            assert runtime.get_snapshot().midi_in_bpm is None
+    runtime._process_pending()
+
+    snapshot = runtime.get_snapshot()
+    assert snapshot.midi_in_bpm == 120
+    assert not snapshot.midi_in_no_clock
+    assert snapshot.transport.tempo_bpm == 120
+    assert not snapshot.transport.playing
+    assert session.current_tick == 0
+    runtime.close()
+
+
+def test_midi_clock_loss_retains_lock_and_reacquires_without_counting_gap():
+    now = [0]
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: now[0])
+    for index in range(97):
+        now[0] = round(index * 500_000_000 / 24)
+        runtime.enqueue_midi_message(mido.Message("clock"))
+    runtime._process_pending()
+    assert runtime.get_snapshot().midi_in_bpm == 120
+
+    now[0] += 2_000_000_000
+    stopped = runtime._make_snapshot(now[0])
+    assert stopped.midi_in_bpm == 120
+    assert stopped.midi_in_no_clock
+
+    restart = now[0]
+    for index in range(97):
+        now[0] = restart + round(index * 400_000_000 / 24)
+        runtime.enqueue_midi_message(mido.Message("clock"))
+        if index == 0:
+            runtime._process_pending()
+            assert runtime.get_snapshot().midi_in_bpm == 120
+            assert not runtime.get_snapshot().midi_in_no_clock
+    runtime._process_pending()
+    assert runtime.get_snapshot().midi_in_bpm == 150
+    runtime.close()
+
+
+def test_midi_clock_requires_consistent_beat_windows_before_lock():
+    now = [0]
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: now[0])
+    for index in range(97):
+        now[0] = (
+            round(index * 500_000_000 / 24)
+            if index <= 48
+            else 1_000_000_000 + round((index - 48) * 400_000_000 / 24)
+        )
+        runtime.enqueue_midi_message(mido.Message("clock"))
+    runtime._process_pending()
+    assert runtime.get_snapshot().midi_in_bpm is None
+    assert not runtime.get_snapshot().midi_in_no_clock
+    runtime.close()
+
+
+def test_non_clock_messages_and_simultaneous_clock_bursts_do_not_create_a_lock():
+    now = [0]
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: now[0])
+    for _ in range(97):
+        runtime.enqueue_midi_message(mido.Message("clock"))
+    runtime.enqueue_midi_message(mido.Message("start"))
+    runtime.enqueue_midi_message(mido.Message("continue"))
+    runtime.enqueue_midi_message(mido.Message("stop"))
+    runtime._process_pending()
+    assert runtime.get_snapshot().midi_in_bpm is None
+    assert not runtime.get_snapshot().midi_in_no_clock
+
+    now[0] += 2_000_000_000
+    runtime.enqueue_midi_message(mido.Message("clock"))
+    runtime._process_pending()
+    assert runtime.get_snapshot().midi_in_bpm is None
+    assert not runtime.get_snapshot().midi_in_no_clock
+    runtime.close()
+
+
+def test_midi_clock_follows_tempo_changes_with_internal_transport_running():
+    now = [0]
+    session, _ = make_session()
+    session.toggle_transport()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: now[0])
+    for beat_duration in (500_000_000, 400_000_000):
+        start = now[0]
+        for index in range(1, 97):
+            now[0] = start + round(index * beat_duration / 24)
+            runtime.enqueue_midi_message(mido.Message("clock"))
+        runtime._process_pending()
+        if beat_duration == 500_000_000:
+            assert runtime.get_snapshot().midi_in_bpm is None
+    snapshot = runtime.get_snapshot()
+    assert snapshot.midi_in_bpm == 150
+    assert snapshot.transport.playing
+    assert snapshot.transport.tempo_bpm == 120
+    assert session.current_tick == 6912
+    runtime.close()
+
+
+def test_midi_clock_loss_is_published_without_further_input():
+    now = [0]
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(
+        session, clock_ns=lambda: now[0], snapshot_interval=0.05
+    )
+    for index in range(97):
+        now[0] = round(index * 500_000_000 / 24)
+        runtime.enqueue_midi_message(mido.Message("clock"))
+    runtime.start()
+    try:
+        deadline = time.monotonic() + 1
+        while runtime.get_snapshot().midi_in_bpm is None and time.monotonic() < deadline:
+            time.sleep(0.002)
+        assert runtime.get_snapshot().midi_in_bpm == 120
+        now[0] += 2_000_000_000
+        runtime._wake.set()
+        deadline = time.monotonic() + 1
+        while not runtime.get_snapshot().midi_in_no_clock and time.monotonic() < deadline:
+            time.sleep(0.002)
+        assert runtime.get_snapshot().midi_in_no_clock
+        assert runtime.get_snapshot().midi_in_bpm == 120
+    finally:
+        runtime.close()
 
 
 def wait_for_notification(runtime: FourChannelGuiRuntime, kind: str):
@@ -208,6 +380,65 @@ def test_recorder_edits_publish_tape_changes_for_recent_note_feedback():
         channel = runtime.get_snapshot().channels[0]
         assert channel.intervals == (interval,)
         assert channel.tape_revision == notification.tape_revision
+    finally:
+        runtime.close()
+
+
+def test_queued_midi_transport_messages_trigger_recording_with_internal_ticks():
+    class ManualClock:
+        def __init__(self) -> None:
+            self.value = 2_000_000_000
+            self.lock = threading.Lock()
+
+        def __call__(self) -> int:
+            with self.lock:
+                return self.value
+
+        def advance(self, nanoseconds: int) -> None:
+            with self.lock:
+                self.value += nanoseconds
+
+    session, _ = make_session()
+    clock = ManualClock()
+    runtime = FourChannelGuiRuntime(session, clock_ns=clock)
+    runtime.start()
+    try:
+        for kind, value in (
+            (GuiIntentKind.RECORDING_SYNC, "start transport"),
+            (GuiIntentKind.RECORDING_SYNC, "stop transport"),
+            (GuiIntentKind.TRANSPORT, True),
+            (GuiIntentKind.RECORDING_ARM, True),
+        ):
+            runtime.submit(kind, value=value)
+            wait_for_notification(runtime, "command_applied")
+        assert runtime.get_snapshot().recording_state == "WAITING_START"
+
+        clock.advance(50_000_000)
+        runtime.enqueue_midi_message(mido.Message("start"))
+        deadline = time.monotonic() + 1
+        while (
+            runtime.get_snapshot().recording_state != "RECORDING"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.002)
+        assert runtime.get_snapshot().recording_state == "RECORDING"
+
+        clock.advance(10_000_000)
+        runtime.enqueue_midi_message(mido.Message("note_on", note=60, velocity=90))
+        deadline = time.monotonic() + 1
+        while (
+            runtime.get_snapshot().channels[0].live_pitch != 60
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.002)
+        assert runtime.get_snapshot().channels[0].live_pitch == 60
+        clock.advance(40_000_000)
+        runtime.enqueue_midi_message(mido.Message("stop"))
+        notification = wait_for_notification(runtime, "tape_changed")
+        (interval,) = notification.changed_intervals
+        assert (interval.start, interval.duration) == (115, 77)
+        assert runtime.get_snapshot().recording_state == "IDLE"
+        assert runtime.get_snapshot().transport.playing
     finally:
         runtime.close()
 

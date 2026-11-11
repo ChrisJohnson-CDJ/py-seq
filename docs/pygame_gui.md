@@ -36,12 +36,14 @@ Press **Esc**, type a command, and press **Enter**.
 | `start beat N` | Align to the next eligible beat, then wait `N` complete beats |
 | `start gesture [N]` | Begin on the next or `N`th incoming gesture start |
 | `start loop` | Begin at the next wrap of the reference channel |
+| `start transport` | Begin on an incoming MIDI Start message |
 | `stop immediate` | Stop recording when Enter is pressed |
 | `stop beat` | Stop at the next eligible beat boundary from the current origin |
 | `stop after {beats}[+{n}[/{m}]]` | Stop after this duration from recording start |
 | `stop gesture [N]` | Automatically stop after the next or `N`th incoming gesture ends |
 | `stop gesture [N] cycle` / `stop gesture [N] cyc` | Record through the `N`th gesture end, then stop at the next incoming gesture start |
 | `stop loop` | Stop at the next wrap of the reference channel |
+| `stop transport` | Automatically stop on an incoming MIDI Stop message |
 | `reference N` | Select reference channel `1`-`4` for loop-synchronized start/stop |
 | `reset off` | Disable automatic resets without changing position |
 | `reset beat [length]` | Reset at interval multiples from the current beat origin (default: 1 beat) |
@@ -80,6 +82,13 @@ start commits the tape at its onset without recording that gesture. The start
 still passes through live MIDI articulation. Enter immediately commits and
 disarms recording, including while waiting for the cycle-closing start.
 
+Transport start and stop triggers are independently configured. MIDI Start
+begins an armed, waiting recording; MIDI Stop commits an active recording.
+Enter cancels a waiting start or immediately commits a recording waiting for
+MIDI Stop. These messages do not start or stop playback, and MIDI Continue and
+Clock do not control recording or timing. Recording notes still requires the
+internal playback transport to be running.
+
 Beat reset intervals accept a whole beat count and an optional binary fraction,
 for example `reset beat 3+3/8`; `reset beat` and `reset beat 1` both mean every
 beat. Denominators must be powers of two, and fractional intervals must convert
@@ -107,6 +116,14 @@ An automatic beat reset repeats after its configured interval from each reset;
 a loop reset waits for a complete reference-loop traversal after each reset.
 
 ## Recording and display
+
+The title bar shows the internal looper BPM and `MIDI IN BPM`. The input
+estimate averages 24-clock MIDI beats over four beats, rounds to the nearest
+whole BPM, and requires the two halves of the window to agree within 5%; it
+shows `---` before a lock. After two seconds without MIDI clocks, the last
+locked value remains visible with `(no clock)`. New clocks clear that indicator
+and establish a fresh estimate after four consistent beats. Incoming clocks
+never change the looper's tempo or timing.
 
 Recording status is shown as `IDLE`, `WAITING_START`, `RECORDING`, or
 `WAITING_STOP`. Waiting starts do not capture notes; recording begins at the

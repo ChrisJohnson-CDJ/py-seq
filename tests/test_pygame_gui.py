@@ -178,6 +178,17 @@ def test_recording_sync_command_parser_supports_modes_and_reference_channel():
         parse_recording_sync_command("stop loop").stop_mode
         is RecordingStopMode.NEXT_REFERENCE_LOOP_START
     )
+    assert (
+        parse_recording_sync_command("start transport").start_mode
+        is RecordingStartMode.MIDI_TRANSPORT
+    )
+    assert (
+        parse_recording_sync_command("stop transport").stop_mode
+        is RecordingStopMode.MIDI_TRANSPORT
+    )
+    for command in ("start transport 2", "stop transport 2"):
+        with pytest.raises(ValueError):
+            parse_recording_sync_command(command)
     assert parse_recording_sync_command("start beat 2").start_beat_count == 2
     with pytest.raises(ValueError, match="stop beat"):
         parse_recording_sync_command("stop beat 4")
@@ -488,6 +499,19 @@ def test_gui_footer_keeps_recording_configuration_separate_from_status():
         "",
     )
     assert "STOP AFTER 4.375" in after_duration
+    transport, _ = _footer_lines(
+        replace(
+            snapshot,
+            recording_start_mode="MIDI_TRANSPORT",
+            recording_stop_mode="MIDI_TRANSPORT",
+        ),
+        1.0,
+        False,
+        "",
+        "",
+    )
+    assert "START TRANSPORT" in transport
+    assert "STOP TRANSPORT" in transport
 
 
 def test_recording_mode_labels_are_explicit_and_concise():
@@ -966,7 +990,17 @@ def test_valid_loop_stored_note_keeps_its_existing_screen_geometry():
     assert surface.clips[3] is None
 
 
-def test_zero_tempo_uses_beats_when_seconds_are_requested():
+@pytest.mark.parametrize(
+    ("input_bpm", "no_clock", "expected_text"),
+    [
+        (None, False, "MIDI IN BPM ---"),
+        (120, False, "MIDI IN BPM 120"),
+        (889, True, "MIDI IN BPM 889 (no clock)"),
+    ],
+)
+def test_zero_tempo_uses_beats_and_title_bar_displays_input_bpm(
+    input_bpm, no_clock, expected_text
+):
     class Rect:
         def __init__(self, x, y, width, height):
             self.x = x
@@ -1017,6 +1051,7 @@ def test_zero_tempo_uses_beats_when_seconds_are_requested():
     class Screen:
         def __init__(self):
             self.texts = []
+            self.placements = {}
             self.clip = None
 
         def get_size(self):
@@ -1028,6 +1063,7 @@ def test_zero_tempo_uses_beats_when_seconds_are_requested():
         def blit(self, text, position):
             assert position
             self.texts.append(text)
+            self.placements[text] = position
 
         def get_clip(self):
             return self.clip
@@ -1072,6 +1108,8 @@ def test_zero_tempo_uses_beats_when_seconds_are_requested():
         lifecycle="running",
         notification_overflow_count=0,
         midi_input_overflow_count=0,
+        midi_in_bpm=input_bpm,
+        midi_in_no_clock=no_clock,
     )
     font = Font()
     screen = Screen()
@@ -1091,6 +1129,14 @@ def test_zero_tempo_uses_beats_when_seconds_are_requested():
     )
 
     assert any("LOOP 4 BEATS   --:-- ( --%)" in text for text in screen.texts)
+    assert expected_text in screen.texts
+    assert "0 BPM" in screen.texts
+    status_text = "MIDI IN --  OUT 0/4"
+    assert status_text in screen.texts
+    assert (
+        screen.placements[expected_text][0] + font.size(expected_text)[0]
+        < screen.placements[status_text][0]
+    )
     assert sum(line[1] == LOOP_BOUNDARY for line in pygame.draw.lines) == 1
     assert any(
         len(rectangle_call[0]) > 2

@@ -8,7 +8,8 @@ A four-channel MIDI looper with independent loops and a Pygame interface.
 
 - Shared monotonic transport with independent four-channel loop lengths/phases
 - MIDI input and loop playback through selected output routes
-- Immediate, beat-, reference-loop-, and first-note-synchronized recording
+- Display-only MIDI input BPM, averaged from incoming clock ticks
+- Immediate, beat-, reference-loop-, gesture-, and MIDI transport-synchronized recording
 - Overdub and overwrite recording, with loop state held in memory
 - Optional Pygame interface; host timing is independent of GUI redraws
 
