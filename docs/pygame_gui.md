@@ -14,7 +14,7 @@ commands and renders snapshots. The display is not the playback clock.
 | Backspace | Toggle overwrite for the selected channel; enabling overwrite also arms recording |
 | Delete | Clear the selected channel's tape |
 | D | Toggle loop-length display between beats and seconds |
-| R | Reset global beat position and all loop phases to zero |
+| R | Reset the global beat origin, grid, and all loop phases to zero |
 | Esc | Open command entry; Esc in the prompt cancels |
 | Q / close window | Shut down the host and release MIDI resources |
 
@@ -32,19 +32,19 @@ Press **Esc**, type a command, and press **Enter**.
 | `pBBB:PPP` | Send bank MSB and program, each from `000` to `127` |
 | `length {beats}[+{n}[/{m}]]` | Set the selected empty channel's loop length |
 | `start immediate` | Begin recording as soon as armed |
-| `start beat` | Begin at the next eligible global beat boundary |
+| `start beat` | Begin at the next eligible beat boundary from the current origin |
 | `start beat N` | Align to the next eligible beat, then wait `N` complete beats |
 | `start gesture [N]` | Begin on the next or `N`th incoming gesture start |
 | `start loop` | Begin at the next wrap of the reference channel |
 | `stop immediate` | Stop recording when Enter is pressed |
-| `stop beat` | Stop at the next eligible global beat boundary |
+| `stop beat` | Stop at the next eligible beat boundary from the current origin |
 | `stop after {beats}[+{n}[/{m}]]` | Stop after this duration from recording start |
 | `stop gesture [N]` | Automatically stop after the next or `N`th incoming gesture ends |
 | `stop gesture [N] cycle` / `stop gesture [N] cyc` | Record through the `N`th gesture end, then stop at the next incoming gesture start |
 | `stop loop` | Stop at the next wrap of the reference channel |
 | `reference N` | Select reference channel `1`-`4` for loop-synchronized start/stop |
 | `reset off` | Disable automatic resets without changing position |
-| `reset beat [length]` | Reset at global-counter multiples of the interval (default: 1 beat) |
+| `reset beat [length]` | Reset at interval multiples from the current beat origin (default: 1 beat) |
 | `reset loop` | Reset at each future wrap of the reference channel |
 
 Start and stop modes default to immediate. Configure a reference channel before
@@ -53,18 +53,19 @@ reference itself for synchronized recording. Loop reset requires a defined
 positive-length reference loop, which may contain no notes. Changing its
 reference channel or phase selects the next future wrap. Clearing the
 reference loop so its length becomes undefined disables loop reset. Recording
-beat counts align to the next eligible global beat boundary; any partial beat
-before alignment is excluded. A count of `N` waits `N` full beats after
-alignment. While stopped exactly on a not-yet-processed beat boundary, the
-boundary is eligible when transport starts. Beat counts pause with transport.
+beat counts align to the next eligible beat boundary from the current global
+beat origin; any partial beat before alignment is excluded. A count of `N`
+waits `N` full beats after alignment. While stopped exactly on a not-yet-
+processed beat boundary, the boundary is eligible when transport starts. Beat
+counts pause with transport.
 
-`stop beat` stops at the next eligible global beat boundary; numeric counts are
-not accepted with this command. `stop after` accepts the same whole and
-fractional beat syntax as `length` (for example `stop after 4+3/8` or
-`stop after 0+1/4`). Its positive duration is converted to exact 960-PPQN ticks
-and measured from the actual recording start tick, without beat alignment. Its
-timer starts only when recording begins, including when a synchronized start is
-used.
+`stop beat` stops at the next eligible beat boundary from the current global
+beat origin; numeric counts are not accepted with this command. `stop after`
+accepts the same whole and fractional beat syntax as `length` (for example
+`stop after 4+3/8` or `stop after 0+1/4`). Its positive duration is converted
+to exact 960-PPQN ticks and measured from the actual recording start tick,
+without beat alignment. Its timer starts only when recording begins, including
+when a synchronized start is used.
 
 Gesture starts count incoming `VOICE_START` events; a gesture already in
 progress when recording is armed does not count toward a gesture-synchronized
@@ -83,9 +84,9 @@ Beat reset intervals accept a whole beat count and an optional binary fraction,
 for example `reset beat 3+3/8`; `reset beat` and `reset beat 1` both mean every
 beat. Denominators must be powers of two, and fractional intervals must convert
 to an exact number of ticks at 960 PPQN. Reset events are aligned to positive
-multiples of the interval on the global counter. Changing the interval selects
-the next future multiple and does not immediately reset. Manual reset does not
-restart this schedule.
+multiples of the interval from the current beat origin. Changing the interval
+selects the next future multiple and does not immediately reset. A manual reset
+establishes a new beat origin and restarts this schedule from that origin.
 
 The `length` command accepts a whole beat count with an optional fractional
 part, such as `length 4+1`, `length 3+3/8`, or `length 0+1/64`. Omitted
@@ -99,9 +100,11 @@ not supported.
 The **R** key performs one immediate reset without changing the configured
 automatic reset mode. A reset commits active recording at the reset tick,
 cancels a waiting start, releases playback notes, preserves live MIDI input,
-tapes, tempo, and transport state, and rephases all lanes to zero. An automatic
-beat reset repeats at the next global-counter multiple; a loop reset waits for
-a complete reference-loop traversal after each reset.
+tapes, tempo, and transport state, and rephases all lanes to zero. It also
+establishes the new global beat origin: the beat grid and beat-synchronized
+recording align to the reset, regardless of earlier loop or recording offsets.
+An automatic beat reset repeats after its configured interval from each reset;
+a loop reset waits for a complete reference-loop traversal after each reset.
 
 ## Recording and display
 
@@ -125,6 +128,12 @@ The configuration line shows zero-based musical beat position rounded to a
 stop modes and beat counts, reference channel, and reset mode. Rounding is
 display-only; the internal tick position remains precise. The second line
 shows status messages or the active command prompt.
+
+Timeline beat grid lines follow the global beat origin used by `start beat` and
+`stop beat`. A reset places beat zero and every channel's loop phase zero under
+the playhead without changing recorded note offsets or loop lengths. Subsequent
+loop boundaries diverge according to each loop's length. An immediate start can
+still create a fractional-length loop even when its stop is beat-synchronized.
 
 For MIDI device selection and command-line options, run
 `python -m py_seq.pygame_gui --help` or see the launch example in

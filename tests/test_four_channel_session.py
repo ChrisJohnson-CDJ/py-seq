@@ -1548,6 +1548,54 @@ def test_reset_rephases_all_loops_and_only_retriggers_phase_zero_onsets():
     session.close()
 
 
+def test_reset_rephases_free_recorded_loop_and_beat_synchronization():
+    session, _ = make_session((0, 960, 600, 800))
+    session.tape(1).insert(IntervalInsert(25, 50, 64, 80, 1))
+    session.toggle_transport()
+    session.advance(TICKS_PER_BEAT // 2)
+    session.set_recording_armed(True)
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90),
+        TICKS_PER_BEAT // 2 + 20,
+    )
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0),
+        TICKS_PER_BEAT // 2 + 70,
+    )
+    session.advance(1680)
+    session.set_recording_armed(False)
+
+    original_lengths = tuple(session.tape(i).length_ticks for i in range(4))
+    original_intervals = tuple(session.tape(i).intervals() for i in range(4))
+    assert session.phase_origin_tick(0) == TICKS_PER_BEAT // 2
+    assert original_lengths[0] == 1200
+    assert original_intervals[0][0].start == 20
+
+    session.reset(2000)
+
+    assert session.musical_tick == 0
+    assert tuple(session.phase_origin_tick(i) for i in range(4)) == (2000,) * 4
+    assert tuple(session.tape(i).length_ticks for i in range(4)) == original_lengths
+    assert tuple(session.tape(i).intervals() for i in range(4)) == original_intervals
+
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.NEXT_BEAT,
+        stop_mode=RecordingStopMode.NEXT_BEAT,
+    )
+    session.set_recording_armed(True)
+    assert session.recording_state is RecordingState.WAITING_START
+    session.advance(2000 + TICKS_PER_BEAT - 1)
+    assert session.recording_state is RecordingState.WAITING_START
+    session.advance(2000 + TICKS_PER_BEAT)
+    assert session.recording_state is RecordingState.RECORDING
+    session.request_recording_stop()
+    assert session.recording_state is RecordingState.WAITING_STOP
+    session.advance(2000 + 2 * TICKS_PER_BEAT)
+    assert session.recording_state is RecordingState.IDLE
+    assert session.current_tick == 2000 + 2 * TICKS_PER_BEAT
+    session.close()
+
+
 def test_reset_while_paused_keeps_transport_stopped_and_live_note_state():
     session, sinks = make_session()
     session.tape(0).insert(IntervalInsert(0, 100, 60, 90, 1))
@@ -1662,29 +1710,29 @@ def test_recurring_beat_reset_survives_large_advances_and_transport_pause():
     session.close()
 
 
-def test_manual_reset_does_not_restart_global_beat_reset_schedule():
+def test_manual_reset_restarts_beat_reset_schedule_from_new_origin():
     session, _ = make_session()
     session.configure_reset(ResetMode.BEAT, interval_beats=1)
     session.toggle_transport()
     session.advance(500)
     session.reset(500)
-    session.advance(TICKS_PER_BEAT - 1)
+    session.advance(500 + TICKS_PER_BEAT - 1)
 
-    assert session.musical_tick == TICKS_PER_BEAT - 1 - 500
+    assert session.musical_tick == TICKS_PER_BEAT - 1
     assert session.reset_mode is ResetMode.BEAT
-    session.advance(TICKS_PER_BEAT)
+    session.advance(500 + TICKS_PER_BEAT)
     assert session.musical_tick == 0
     assert session.reset_mode is ResetMode.BEAT
     session.reset(1500)
-    session.advance(2 * TICKS_PER_BEAT - 1)
-    assert session.musical_tick == 2 * TICKS_PER_BEAT - 1 - 1500
-    session.advance(2 * TICKS_PER_BEAT)
+    session.advance(1500 + TICKS_PER_BEAT - 1)
+    assert session.musical_tick == TICKS_PER_BEAT - 1
+    session.advance(1500 + TICKS_PER_BEAT)
     assert session.musical_tick == 0
     session.configure_reset(ResetMode.OFF)
     session.close()
 
 
-def test_fractional_beat_reset_uses_global_counter_multiples():
+def test_fractional_beat_reset_uses_multiples_from_its_origin():
     session, _ = make_session()
     interval_ticks = 3 * TICKS_PER_BEAT + 3 * TICKS_PER_BEAT // 8
     session.toggle_transport()
@@ -1702,7 +1750,7 @@ def test_fractional_beat_reset_uses_global_counter_multiples():
     session.close()
 
 
-def test_fractional_reset_alignment_uses_the_next_global_multiple():
+def test_fractional_reset_alignment_uses_the_next_origin_relative_multiple():
     session, _ = make_session()
     interval_ticks = 3 * TICKS_PER_BEAT + 3 * TICKS_PER_BEAT // 8
     session.toggle_transport()
@@ -1718,7 +1766,7 @@ def test_fractional_reset_alignment_uses_the_next_global_multiple():
     session.close()
 
 
-def test_changing_reset_interval_selects_next_global_multiple_without_resetting():
+def test_changing_reset_interval_selects_next_origin_relative_multiple():
     session, _ = make_session()
     session.toggle_transport()
     session.advance(10 * TICKS_PER_BEAT + TICKS_PER_BEAT // 2)

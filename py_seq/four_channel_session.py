@@ -368,8 +368,7 @@ class FourChannelSession:
         try:
             self.coordinator.reset_phases(tick, disarm_channels=disarm_channels)
         finally:
-            if automatic:
-                self._schedule_next_reset(tick)
+            self._schedule_next_reset(tick)
         if self.transport_running:
             self._mark_beat_boundaries_processed(tick)
 
@@ -378,8 +377,9 @@ class FourChannelSession:
         self._reset_reference_signature = None
         if self._reset_mode is ResetMode.BEAT:
             assert self._reset_interval_ticks is not None
-            self._next_reset_tick = (
-                tick // self._reset_interval_ticks + 1
+            elapsed = tick - self._position_origin_tick
+            self._next_reset_tick = self._position_origin_tick + (
+                elapsed // self._reset_interval_ticks + 1
             ) * self._reset_interval_ticks
         elif self._reset_mode is ResetMode.LOOP:
             channel, tape = self._require_defined_reference()
@@ -1048,11 +1048,13 @@ class FourChannelSession:
             width = TICKS_PER_BEAT
         else:
             raise ValueError("mode does not use a global transport boundary")
+        elapsed = tick - self._position_origin_tick
+        remainder = elapsed % width
         boundary = (
             tick
-            if tick % width == 0
+            if remainder == 0
             and self._last_processed_beat_boundary_tick != tick
-            else (tick // width + 1) * width
+            else self._position_origin_tick + (elapsed // width + 1) * width
         )
         return boundary + (beat_count or 0) * width
 
@@ -1173,7 +1175,11 @@ class FourChannelSession:
         return 1 if current_count is None else current_count
 
     def _mark_beat_boundaries_processed(self, tick: int) -> None:
-        boundary = tick // TICKS_PER_BEAT * TICKS_PER_BEAT
+        elapsed = tick - self._position_origin_tick
+        boundary = (
+            self._position_origin_tick
+            + elapsed // TICKS_PER_BEAT * TICKS_PER_BEAT
+        )
         if (
             self._last_processed_beat_boundary_tick is None
             or boundary > self._last_processed_beat_boundary_tick

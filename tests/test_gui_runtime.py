@@ -441,6 +441,43 @@ def test_runtime_reset_intents_preserve_automatic_mode_and_publish_musical_posit
         runtime.close()
 
 
+def test_runtime_snapshot_rezeros_beat_position_and_loop_phases_after_resets():
+    session, _ = make_session()
+    session.toggle_transport()
+    session.advance(200)
+    session.reset(200)
+    snapshot = FourChannelGuiRuntime(session).get_snapshot()
+    assert snapshot.transport.position_ticks == 0
+    assert tuple(channel.phase_origin_tick for channel in snapshot.channels) == (
+        0,
+        0,
+        0,
+        0,
+    )
+
+    session.configure_reset(ResetMode.BEAT, interval_ticks=3240)
+    session.advance(200 + 3240)
+    snapshot = FourChannelGuiRuntime(session).get_snapshot()
+    assert snapshot.transport.position_ticks == 0
+    assert tuple(channel.phase_origin_tick for channel in snapshot.channels) == (
+        0,
+        0,
+        0,
+        0,
+    )
+
+    session.advance(200 + 2 * 3240)
+    snapshot = FourChannelGuiRuntime(session).get_snapshot()
+    assert snapshot.transport.position_ticks == 0
+    assert tuple(channel.phase_origin_tick for channel in snapshot.channels) == (
+        0,
+        0,
+        0,
+        0,
+    )
+    session.close()
+
+
 def test_runtime_loop_length_command_updates_only_its_channel():
     session, _ = make_session()
     runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)

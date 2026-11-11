@@ -5,14 +5,16 @@ from dataclasses import replace
 import mido
 import pytest
 
-from midi_output import MidoOutputPortSink
+from midi_output import CollectingMidiSink, MidoOutputPortSink
 from py_seq.gui_runtime import (
+    FourChannelGuiRuntime,
     GuiChannelSnapshot,
     GuiSnapshot,
     GuiTransportSnapshot,
 )
 from py_seq.pygame_gui import (
     GuiCommandError,
+    GRID,
     LOOP_BOUNDARY,
     PLAYHEAD,
     _beat_to_x,
@@ -31,6 +33,8 @@ from py_seq.pygame_gui import (
     parse_program_command,
 )
 from py_seq.four_channel_session import (
+    FourChannelSession,
+    MidiRoute,
     RecordingStartMode,
     RecordingStopMode,
     ResetMode,
@@ -699,6 +703,161 @@ def test_uninitialized_pygame_lane_draws_grid_without_loop_arithmetic():
     )
 
     assert sum(line[1] == LOOP_BOUNDARY for line in pygame.draw.lines) == 1
+
+
+@pytest.mark.parametrize(
+    "start_mode", [RecordingStartMode.IMMEDIATE, RecordingStartMode.NEXT_BEAT]
+)
+def test_recorded_stop_boundary_matches_reset_aligned_grid(start_mode):
+    class Draw:
+        def __init__(self):
+            self.lines = []
+
+        def line(self, *args):
+            self.lines.append(args)
+
+    class FakePygame:
+        def __init__(self):
+            self.draw = Draw()
+
+    class Surface:
+        def get_clip(self):
+            return None
+
+        def set_clip(self, clip):
+            pass
+
+    class Timeline:
+        x = left = y = top = 0
+        width = right = 15360
+        bottom = 20
+
+    routes = tuple(
+        MidiRoute(str(index), index, CollectingMidiSink()) for index in range(4)
+    )
+    session = FourChannelSession((0, 0, 0, 0), 120, routes)
+    session.toggle_transport()
+    session.advance(200)
+    session.reset(200)
+    session.advance(300)
+    session.configure_recording_sync(
+        start_mode=start_mode, stop_mode=RecordingStopMode.NEXT_BEAT
+    )
+    session.set_recording_armed(True)
+    session.advance(1300)
+    session.request_recording_stop()
+    session.advance(2120)
+
+    snapshot = FourChannelGuiRuntime(session).get_snapshot()
+    channel = snapshot.channels[0]
+    assert snapshot.transport.position_ticks == 1920
+    assert channel.phase_origin_tick + channel.loop_length_ticks == 1920
+    assert channel.loop_length_ticks == (
+        1820 if start_mode is RecordingStartMode.IMMEDIATE else 960
+    )
+
+    pygame = FakePygame()
+    timeline = Timeline()
+    display_beats = snapshot.transport.position_ticks / 960
+    _draw_note_lane(
+        pygame,
+        Surface(),
+        channel,
+        (100, 120, 140),
+        timeline,
+        display_beats,
+        set(),
+        None,
+    )
+    view_start = display_beats - 16 * 0.35
+    stop_x = _beat_to_x(2, view_start, timeline)
+    assert any(line[1] == GRID and line[2][0] == stop_x for line in pygame.draw.lines)
+    assert any(
+        line[1] == LOOP_BOUNDARY and line[2][0] == stop_x
+        for line in pygame.draw.lines
+    )
+    if start_mode is RecordingStartMode.NEXT_BEAT:
+        start_x = _beat_to_x(1, view_start, timeline)
+        assert any(
+            line[1] == GRID and line[2][0] == start_x
+            for line in pygame.draw.lines
+        )
+    session.close()
+
+
+def test_reset_draws_free_recorded_loop_origin_on_beat_zero_grid():
+    class Draw:
+        def __init__(self):
+            self.lines = []
+
+        def line(self, *args):
+            self.lines.append(args)
+
+    class FakePygame:
+        def __init__(self):
+            self.draw = Draw()
+
+    class Surface:
+        def get_clip(self):
+            return None
+
+        def set_clip(self, clip):
+            pass
+
+    class Timeline:
+        x = left = y = top = 0
+        width = right = 15360
+        bottom = 20
+
+    routes = tuple(
+        MidiRoute(str(index), index, CollectingMidiSink()) for index in range(4)
+    )
+    session = FourChannelSession((0, 960, 600, 800), 120, routes)
+    session.toggle_transport()
+    session.advance(480)
+    session.set_recording_armed(True)
+    session.process_midi_message(
+        mido.Message("note_on", channel=0, note=60, velocity=90), 500
+    )
+    session.process_midi_message(
+        mido.Message("note_off", channel=0, note=60, velocity=0), 550
+    )
+    session.advance(1680)
+    session.set_recording_armed(False)
+    session.reset(2000)
+
+    snapshot = FourChannelGuiRuntime(session).get_snapshot()
+    channel = snapshot.channels[0]
+    assert snapshot.transport.position_ticks == 0
+    assert channel.phase_origin_tick == 0
+    assert channel.loop_length_ticks == 1200
+    assert tuple(
+        (interval.start, interval.duration, interval.pitch)
+        for interval in channel.intervals
+    ) == ((20, 50, 60),)
+
+    pygame = FakePygame()
+    timeline = Timeline()
+    _draw_note_lane(
+        pygame,
+        Surface(),
+        replace(channel, intervals=()),
+        (100, 120, 140),
+        timeline,
+        snapshot.transport.position_ticks / 960,
+        set(),
+        None,
+    )
+    playhead_x = round(timeline.width * 0.35)
+    assert any(
+        line[1] == GRID and line[2][0] == playhead_x
+        for line in pygame.draw.lines
+    )
+    assert any(
+        line[1] == LOOP_BOUNDARY and line[2][0] == playhead_x
+        for line in pygame.draw.lines
+    )
+    session.close()
 
 
 def test_valid_loop_stored_note_keeps_its_existing_screen_geometry():
