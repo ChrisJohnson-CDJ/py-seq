@@ -605,15 +605,93 @@ def test_counted_gesture_stop_automatically_stops_on_nth_voice_end():
     assert session.tape(0).length_ticks == 40
     assert not session.record_armed
     assert [
-        (message.type, message.note)
+        (getattr(message, "type"), getattr(message, "note"))
         for message in sinks[0].messages
-        if message.type in ("note_on", "note_off")
+        if getattr(message, "type") in ("note_on", "note_off")
     ] == [
         ("note_on", 60),
         ("note_off", 60),
         ("note_on", 62),
         ("note_off", 62),
     ]
+    session.close()
+
+
+def test_configuring_gesture_stop_during_recording_counts_held_gesture_end():
+    session, _ = make_session((0, 1000, 0, 0))
+    session.toggle_transport()
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("note_on", note=60, velocity=90), 10)
+    session.configure_recording_sync(stop_mode=RecordingStopMode.NEXT_GESTURE)
+    session.process_midi_message(mido.Message("note_off", note=60), 20)
+    assert session.recording_state is RecordingState.IDLE
+    (interval,) = session.tape(0).intervals()
+    assert (interval.start, interval.duration) == (10, 10)
+    session.close()
+
+
+def test_reconfiguring_gesture_count_restarts_counter_but_unrelated_changes_do_not():
+    session, _ = make_session()
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.NEXT_GESTURE, stop_gesture_count=3
+    )
+    session.toggle_transport()
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("note_on", note=60, velocity=90), 10)
+    session.process_midi_message(mido.Message("note_off", note=60), 20)
+    session.configure_recording_sync(reference_channel=1)
+    session.process_midi_message(mido.Message("note_on", note=62, velocity=90), 30)
+    session.process_midi_message(mido.Message("note_off", note=62), 40)
+    assert session.recording_state is RecordingState.RECORDING
+    session.configure_recording_sync(stop_gesture_count=2, stop_gesture_cycle=True)
+    session.process_midi_message(mido.Message("note_on", note=64, velocity=90), 50)
+    session.process_midi_message(mido.Message("note_off", note=64), 60)
+    assert session.recording_state is RecordingState.RECORDING
+    session.process_midi_message(mido.Message("note_on", note=65, velocity=90), 70)
+    session.process_midi_message(mido.Message("note_off", note=65), 80)
+    assert session.recording_state is RecordingState.WAITING_STOP
+    session.process_midi_message(mido.Message("note_on", note=67, velocity=90), 90)
+    assert session.recording_state is RecordingState.IDLE
+    session.close()
+
+
+def test_unrelated_reconfiguration_preserves_gesture_stop_progress():
+    session, _ = make_session()
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.NEXT_GESTURE, stop_gesture_count=2
+    )
+    session.toggle_transport()
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("note_on", note=60, velocity=90), 10)
+    session.process_midi_message(mido.Message("note_off", note=60), 20)
+    session.configure_recording_sync(reference_channel=1, stop_gesture_cycle=True)
+    session.process_midi_message(mido.Message("note_on", note=62, velocity=90), 30)
+    session.process_midi_message(mido.Message("note_off", note=62), 40)
+    assert session.recording_state is RecordingState.WAITING_STOP
+    session.process_midi_message(mido.Message("note_on", note=64, velocity=90), 50)
+    assert session.recording_state is RecordingState.IDLE
+    session.close()
+
+
+def test_switching_away_and_back_to_gesture_stop_starts_a_fresh_count():
+    session, _ = make_session()
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.NEXT_GESTURE, stop_gesture_count=2
+    )
+    session.toggle_transport()
+    session.toggle_recording()
+    session.process_midi_message(mido.Message("note_on", note=60, velocity=90), 10)
+    session.process_midi_message(mido.Message("note_off", note=60), 20)
+    session.configure_recording_sync(stop_mode=RecordingStopMode.IMMEDIATE)
+    session.configure_recording_sync(
+        stop_mode=RecordingStopMode.NEXT_GESTURE, stop_gesture_count=2
+    )
+    session.process_midi_message(mido.Message("note_on", note=62, velocity=90), 30)
+    session.process_midi_message(mido.Message("note_off", note=62), 40)
+    assert session.recording_state is RecordingState.RECORDING
+    session.process_midi_message(mido.Message("note_on", note=64, velocity=90), 50)
+    session.process_midi_message(mido.Message("note_off", note=64), 60)
+    assert session.recording_state is RecordingState.IDLE
     session.close()
 
 
@@ -651,9 +729,9 @@ def test_cycle_gesture_stop_commits_at_next_start_and_keeps_trigger_live():
         mido.Message("note_off", channel=0, note=67, velocity=0), 90
     )
     assert [
-        (message.type, message.note)
+        (getattr(message, "type"), getattr(message, "note"))
         for message in sinks[0].messages
-        if message.type in ("note_on", "note_off")
+        if getattr(message, "type") in ("note_on", "note_off")
     ] == [
         ("note_on", 60),
         ("note_off", 60),
@@ -1380,9 +1458,9 @@ def test_stop_after_automatically_disarms_without_silencing_live_note():
     )
     assert session.articulators[0].live_voice is None
     assert [
-        (message.type, message.note)
+        (getattr(message, "type"), getattr(message, "note"))
         for message in sinks[0].messages
-        if message.type in ("note_on", "note_off")
+        if getattr(message, "type") in ("note_on", "note_off")
     ] == [("note_on", 60), ("note_off", 60)]
     interval, = session.tape(0).intervals()
     assert (interval.start, interval.duration, interval.pitch) == (10, 10, 60)

@@ -688,6 +688,38 @@ def _handle_notification(
     )
 
 
+def _reconcile_projected_state(
+    projected: dict[str, object],
+    pending_request_ids: dict[str, int],
+    snapshot: GuiSnapshot,
+) -> None:
+    for field, request_id in tuple(pending_request_ids.items()):
+        if request_id <= snapshot.last_processed_request_id:
+            projected.pop(field, None)
+            pending_request_ids.pop(field)
+
+
+def _project_recording_toggle(state: str, snapshot: GuiSnapshot) -> str:
+    if state == "IDLE":
+        return (
+            "RECORDING"
+            if snapshot.recording_start_mode == "IMMEDIATE"
+            else "WAITING_START"
+        )
+    if state == "WAITING_START":
+        return "IDLE"
+    if state == "RECORDING":
+        return (
+            "IDLE"
+            if snapshot.recording_stop_mode
+            in ("IMMEDIATE", "AFTER_DURATION", "NEXT_GESTURE", "MIDI_TRANSPORT")
+            else "WAITING_STOP"
+        )
+    if state == "WAITING_STOP":
+        return "IDLE" if snapshot.recording_stop_gesture_cycle else "RECORDING"
+    raise ValueError(f"unknown recording state: {state}")
+
+
 def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
     try:
         import pygame
@@ -720,7 +752,6 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
         shutdown_sent = False
         projected: dict[str, object] = {}
         pending_request_ids: dict[str, int] = {}
-        request_fields: dict[int, set[str]] = {}
 
         def submit_projected(
             kind: GuiIntentKind,
@@ -736,12 +767,9 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                 value=value,
                 bank_msb=bank_msb,
             )
-            fields = set(state_changes or ())
             for field, projected_value in (state_changes or {}).items():
                 projected[field] = projected_value
                 pending_request_ids[field] = request_id
-            if fields:
-                request_fields[request_id] = fields
             return request_id
 
         running = True
@@ -749,16 +777,6 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
             now_ns = time.monotonic_ns()
             snapshot = runtime.get_snapshot()
             for notification in runtime.drain_notifications():
-                if notification.request_id is not None:
-                    fields = request_fields.pop(notification.request_id, set())
-                    if notification.kind == "command_rejected":
-                        for field in fields:
-                            if (
-                                pending_request_ids.get(field)
-                                == notification.request_id
-                            ):
-                                projected.pop(field, None)
-                                pending_request_ids.pop(field, None)
                 candidate_text, candidate_until, candidate_severity = _handle_notification(
                     notification,
                     snapshot,
@@ -773,17 +791,7 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                     status_text = candidate_text
                     status_until = candidate_until
                     status_severity = candidate_severity
-            snapshot_state = {
-                "selected_channel_id": snapshot.selected_channel_id,
-                "transport_playing": snapshot.transport.playing,
-                "recording_armed": snapshot.recording_armed,
-                "recording_state": snapshot.recording_state,
-                "overwrite_channel_id": snapshot.overwrite_channel_id,
-            }
-            for field, value in tuple(projected.items()):
-                if snapshot_state.get(field) == value:
-                    projected.pop(field, None)
-                    pending_request_ids.pop(field, None)
+            _reconcile_projected_state(projected, pending_request_ids, snapshot)
             display_beats = interpolated_position_beats(snapshot, now_ns)
             view_start = display_beats - VISIBLE_BEATS * PLAYHEAD_POSITION
             intervals_by_id = {
@@ -957,26 +965,7 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                     snapshot.recording_state,
                                 )
                             )
-                            next_state = {
-                                "IDLE": (
-                                    "RECORDING"
-                                    if snapshot.recording_start_mode == "IMMEDIATE"
-                                    else "WAITING_START"
-                                ),
-                                "WAITING_START": "IDLE",
-                                "RECORDING": (
-                                    "IDLE"
-                                    if snapshot.recording_stop_mode
-                                    in ("IMMEDIATE", "MIDI_TRANSPORT")
-                                    else "WAITING_STOP"
-                                ),
-                                "WAITING_STOP": "RECORDING",
-                            }[state]
-                            if (
-                                state == "WAITING_STOP"
-                                and snapshot.recording_stop_gesture_cycle
-                            ):
-                                next_state = "IDLE"
+                            next_state = _project_recording_toggle(state, snapshot)
                             changes: dict[str, object] = {
                                 "recording_state": next_state,
                                 "recording_armed": next_state != "IDLE",
@@ -1014,7 +1003,16 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                 )
                             }
                             if enable_overwrite:
+                                was_armed = bool(
+                                    projected.get(
+                                        "recording_armed", snapshot.recording_armed
+                                    )
+                                )
                                 changes["recording_armed"] = True
+                                if not was_armed:
+                                    changes["recording_state"] = (
+                                        _project_recording_toggle("IDLE", snapshot)
+                                    )
                             submit_projected(
                                 GuiIntentKind.OVERWRITE,
                                 state_changes=changes,

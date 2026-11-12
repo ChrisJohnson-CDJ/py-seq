@@ -1,4 +1,4 @@
-"""Two-channel orchestration for recording, scheduling, and live input."""
+"""Multi-channel orchestration for recording, scheduling, and live input."""
 
 from __future__ import annotations
 
@@ -55,9 +55,11 @@ class PlaybackCoordinator:
             raise TypeError("channels must contain PlaybackChannel values")
         self.channels = channels
         self._focused_channel = self._channel_index(focused_channel)
-        if channels[0].recorder.current_tick != channels[1].recorder.current_tick:
-            raise ValueError("both recorders must start at the same tick")
         self._current_tick = channels[0].recorder.current_tick
+        if any(
+            channel.recorder.current_tick != self._current_tick for channel in channels
+        ):
+            raise ValueError("all recorders must start at the same tick")
         self._input_gesture_id: int | None = None
         self._suppressed_recording_gesture_id: int | None = None
 

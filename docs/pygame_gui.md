@@ -76,6 +76,9 @@ including ends from gestures that were already in progress. The start and stop
 counters are independent, so the gesture that triggers a start may also
 produce the first counted end. `VOICE_CHANGE` events never affect either
 counter. A normal gesture stop automatically disarms recording on its Nth end.
+Selecting gesture stop or changing its count during recording starts a fresh
+count; the end of a gesture already in progress counts. Changing unrelated
+settings or only the cycle option preserves the current count.
 With `cycle` (or `cyc`), the Nth end completes the recorded gesture but
 recording continues through the following silence; the next incoming gesture
 start commits the tape at its onset without recording that gesture. The start

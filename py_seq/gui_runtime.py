@@ -32,14 +32,13 @@ logger = logging.getLogger(__name__)
 _CHANNEL_IDS = tuple(f"channel-{index + 1}" for index in range(CHANNEL_COUNT))
 _MIDI_CLOCKS_PER_BEAT = 24
 _MIDI_CLOCK_AVERAGING_BEATS = 4
+_MIDI_CLOCK_WINDOW_SIZE = _MIDI_CLOCK_AVERAGING_BEATS * _MIDI_CLOCKS_PER_BEAT + 1
 _MIDI_CLOCK_TIMEOUT_NS = 2_000_000_000
 
 
 class _MidiClockTempo:
     def __init__(self) -> None:
-        self._timestamps: deque[int] = deque(
-            maxlen=_MIDI_CLOCK_AVERAGING_BEATS * _MIDI_CLOCKS_PER_BEAT + 1
-        )
+        self._timestamps: deque[int] = deque(maxlen=_MIDI_CLOCK_WINDOW_SIZE)
         self._last_clock_ns: int | None = None
         self.bpm: int | None = None
 
@@ -51,7 +50,7 @@ class _MidiClockTempo:
             self._timestamps.clear()
         self._last_clock_ns = timestamp_ns
         self._timestamps.append(timestamp_ns)
-        if len(self._timestamps) < self._timestamps.maxlen:
+        if len(self._timestamps) < _MIDI_CLOCK_WINDOW_SIZE:
             return
         midpoint = _MIDI_CLOCK_AVERAGING_BEATS * _MIDI_CLOCKS_PER_BEAT // 2
         first_half = self._timestamps[midpoint] - self._timestamps[0]
@@ -152,6 +151,7 @@ class GuiSnapshot:
     recording_stop_after_ticks: int | None = None
     midi_in_bpm: int | None = None
     midi_in_no_clock: bool = False
+    last_processed_request_id: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,12 +217,14 @@ class FourChannelGuiRuntime:
         self._midi_events: queue.Queue[tuple[mido.Message, int]] = queue.Queue(
             input_capacity
         )
+        self._event_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop_requested = threading.Event()
         self._input_overflow_lock = threading.Lock()
         self._midi_input_overflow_count = 0
         self._notification_overflow_count = 0
         self._request_id = 0
+        self._last_processed_request_id = 0
         self._revision = 0
         self._tape_revisions = [tape.revision for tape in session.tapes]
         self._intervals = tuple(tape.intervals() for tape in session.tapes)
@@ -289,22 +291,23 @@ class FourChannelGuiRuntime:
             or self._stop_requested.is_set()
         ):
             raise GuiHostUnavailable("host runtime is not accepting commands")
-        self._request_id += 1
-        intent = GuiIntent(
-            self._request_id,
-            self.clock_ns(),
-            kind,
-            channel_id,
-            value,
-            bank_msb,
-        )
-        self._validate_intent(intent)
-        try:
-            self._commands.put_nowait(intent)
-        except queue.Full as error:
-            raise GuiCommandQueueFull(
-                "host command queue is full; command was not accepted"
-            ) from error
+        with self._event_lock:
+            self._request_id += 1
+            intent = GuiIntent(
+                self._request_id,
+                self.clock_ns(),
+                kind,
+                channel_id,
+                value,
+                bank_msb,
+            )
+            self._validate_intent(intent)
+            try:
+                self._commands.put_nowait(intent)
+            except queue.Full as error:
+                raise GuiCommandQueueFull(
+                    "host command queue is full; command was not accepted"
+                ) from error
         self._wake.set()
         return intent.request_id
 
@@ -325,11 +328,12 @@ class FourChannelGuiRuntime:
     def enqueue_midi_message(self, message: mido.Message) -> None:
         if not isinstance(message, mido.Message):
             raise TypeError("message must be a mido.Message")
-        try:
-            self._midi_events.put_nowait((message.copy(), self.clock_ns()))
-        except queue.Full:
-            with self._input_overflow_lock:
-                self._midi_input_overflow_count += 1
+        with self._event_lock:
+            try:
+                self._midi_events.put_nowait((message.copy(), self.clock_ns()))
+            except queue.Full:
+                with self._input_overflow_lock:
+                    self._midi_input_overflow_count += 1
         self._wake.set()
 
     def close(self, timeout: float | None = None) -> None:
@@ -355,15 +359,13 @@ class FourChannelGuiRuntime:
         try:
             self._publish_snapshot(self.clock_ns())
             while not self._stop_requested.is_set():
-                self._process_pending()
+                now_ns = self._process_pending()
                 if self._stop_requested.is_set():
                     break
-                now_ns = self.clock_ns()
                 if self._midi_input_has_overflowed():
                     raise RuntimeError(
                         "MIDI input queue overflow; stopping to avoid stuck notes"
                     )
-                self._advance_to(self._tick_at(now_ns))
                 if now_ns - self._last_snapshot_ns >= int(
                     self.snapshot_interval * 1_000_000_000
                 ):
@@ -392,20 +394,23 @@ class FourChannelGuiRuntime:
             )
             self._publish_snapshot(self.clock_ns())
 
-    def _process_pending(self) -> None:
+    def _process_pending(self) -> int:
         pending: list[tuple[int, int, object]] = []
-        for _ in range(128):
-            try:
-                message, timestamp_ns = self._midi_events.get_nowait()
-            except queue.Empty:
-                break
-            pending.append((timestamp_ns, 0, message))
-        for _ in range(128):
-            try:
-                intent = self._commands.get_nowait()
-            except queue.Empty:
-                break
-            pending.append((intent.submitted_at_ns, 1, intent))
+        # Timestamping, enqueueing, and the batch watermark share this lock.
+        with self._event_lock:
+            while True:
+                try:
+                    message, timestamp_ns = self._midi_events.get_nowait()
+                except queue.Empty:
+                    break
+                pending.append((timestamp_ns, 0, message))
+            while True:
+                try:
+                    intent = self._commands.get_nowait()
+                except queue.Empty:
+                    break
+                pending.append((intent.submitted_at_ns, 1, intent))
+            cutoff_ns = self.clock_ns()
 
         pending.sort(key=lambda item: (item[0], item[1]))
         processed = False
@@ -415,7 +420,7 @@ class FourChannelGuiRuntime:
             tick = self._tick_at(timestamp_ns)
             if isinstance(item, mido.Message):
                 processed = True
-                if item.type == "clock":
+                if getattr(item, "type", None) == "clock":
                     self._midi_clock_tempo.observe(timestamp_ns)
                 try:
                     self.session.process_midi_message(item, tick)
@@ -462,10 +467,12 @@ class FourChannelGuiRuntime:
                                 tick=tick,
                             )
                         )
-        if processed and not self._stop_requested.is_set():
-            now_ns = self.clock_ns()
-            self._advance_to(self._tick_at(now_ns))
-            self._publish_snapshot(now_ns)
+                self._last_processed_request_id = intent.request_id
+        if not self._stop_requested.is_set():
+            self._advance_to(self._tick_at(cutoff_ns))
+            if processed:
+                self._publish_snapshot(cutoff_ns)
+        return cutoff_ns
 
     def _apply_intent(self, intent: GuiIntent, tick: int) -> None:
         if intent.kind is GuiIntentKind.RESET:
@@ -688,11 +695,13 @@ class FourChannelGuiRuntime:
             recording_stop_after_ticks=self.session.stop_after_ticks,
             midi_in_bpm=self._midi_clock_tempo.bpm,
             midi_in_no_clock=self._midi_clock_tempo.no_clock(now_ns),
+            last_processed_request_id=self._last_processed_request_id,
         )
 
     def _channel_snapshot(self, index: int) -> GuiChannelSnapshot:
         route = self.session.routes[index]
         live_voice = self.session.coordinator.channels[index].articulator.live_voice
+        live_start_tick = self._live_start_ticks[index]
         return GuiChannelSnapshot(
             channel_id=_CHANNEL_IDS[index],
             name=route.label,
@@ -710,9 +719,8 @@ class FourChannelGuiRuntime:
             live_velocity=None if live_voice is None else live_voice.velocity,
             live_start_tick=(
                 None
-                if self._live_start_ticks[index] is None
-                else self._live_start_ticks[index]
-                - self.session.position_origin_tick
+                if live_start_tick is None
+                else live_start_tick - self.session.position_origin_tick
             ),
             output_connected=route.port_index is not None,
             loop_definition_active=self.session.loop_definition_channel == index,

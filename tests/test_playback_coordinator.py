@@ -1,4 +1,5 @@
 import mido
+import pytest
 
 from articulator import Articulator
 from interval_resolver import IntervalResolver, RecordMode
@@ -46,6 +47,39 @@ def build_coordinator(
             )
         )
     return PlaybackCoordinator(tuple(channels)), tuple(sinks)
+
+
+def test_coordinator_accepts_one_channel():
+    original, _ = build_coordinator()
+    coordinator = PlaybackCoordinator((original.channels[0],))
+    coordinator.start(0)
+    coordinator.advance(10)
+    assert coordinator.current_tick == 10
+
+
+def test_coordinator_rejects_empty_channels():
+    with pytest.raises(ValueError, match="non-empty tuple"):
+        PlaybackCoordinator(())
+
+
+@pytest.mark.parametrize("channel_count", [2, 3, 4])
+def test_coordinator_rejects_mismatched_recorder_ticks_for_every_channel(channel_count):
+    channels = [build_coordinator()[0].channels[0] for _ in range(channel_count)]
+    channels[-1].recorder.advance(12)
+    with pytest.raises(ValueError, match="recorders must start at the same tick"):
+        PlaybackCoordinator(tuple(channels))
+
+
+@pytest.mark.parametrize("channel_count", [1, 2, 3, 4])
+def test_coordinator_accepts_aligned_nonzero_recorder_ticks(channel_count):
+    channels = [build_coordinator()[0].channels[0] for _ in range(channel_count)]
+    for channel in channels:
+        channel.recorder.advance(12)
+    coordinator = PlaybackCoordinator(tuple(channels))
+    assert coordinator.current_tick == 12
+    coordinator.start(12)
+    coordinator.advance(13)
+    assert coordinator.current_tick == 13
 
 
 def test_two_tapes_with_different_lengths_remain_independently_phased():

@@ -141,6 +141,7 @@ def test_timestamps_are_copied_and_never_used_to_reorder():
     first = processor.process(on(60, timestamp_ns=400))
     second = processor.process(on(64, timestamp_ns=12))
     third = processor.process(off(64, timestamp_ns=None))
+    assert first is not None and second is not None and third is not None
     assert [first.timestamp_ns, second.timestamp_ns, third.timestamp_ns] == [400, 12, None]
     assert [first.kind, second.kind, third.kind] == [
         VoiceEventType.VOICE_START,
@@ -151,7 +152,9 @@ def test_timestamps_are_copied_and_never_used_to_reorder():
 
 def test_timestamp_accepts_arbitrarily_large_nonnegative_integers():
     timestamp = 10**100
-    assert MidiVoicePreprocessor().process(on(60, timestamp_ns=timestamp)).timestamp_ns == timestamp
+    result = MidiVoicePreprocessor().process(on(60, timestamp_ns=timestamp))
+    assert result is not None
+    assert result.timestamp_ns == timestamp
 
 
 def test_reset_clears_state_without_event_and_preserves_id_counter():
@@ -247,7 +250,7 @@ def test_constructor_rejects_invalid_channels_and_event_contracts_are_immutable(
             MidiVoicePreprocessor(input_channel=channel)
     instance = MidiInputEvent(MidiInputEventType.OTHER)
     with pytest.raises(FrozenInstanceError):
-        instance.kind = MidiInputEventType.NOTE_ON
+        setattr(instance, "kind", MidiInputEventType.NOTE_ON)
 
 
 def test_transition_sequence_emits_zero_or_one_event_per_message_and_invariants_hold():

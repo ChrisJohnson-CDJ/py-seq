@@ -759,7 +759,9 @@ def test_recorded_stop_boundary_matches_reset_aligned_grid(start_mode):
     routes = tuple(
         MidiRoute(str(index), index, CollectingMidiSink()) for index in range(4)
     )
-    session = FourChannelSession((0, 0, 0, 0), 120, routes)
+    session = FourChannelSession(
+        (0, 0, 0, 0), 120, (routes[0], routes[1], routes[2], routes[3])
+    )
     session.toggle_transport()
     session.advance(200)
     session.reset(200)
@@ -836,7 +838,9 @@ def test_reset_draws_free_recorded_loop_origin_on_beat_zero_grid():
     routes = tuple(
         MidiRoute(str(index), index, CollectingMidiSink()) for index in range(4)
     )
-    session = FourChannelSession((0, 960, 600, 800), 120, routes)
+    session = FourChannelSession(
+        (0, 960, 600, 800), 120, (routes[0], routes[1], routes[2], routes[3])
+    )
     session.toggle_transport()
     session.advance(480)
     session.set_recording_armed(True)

@@ -622,6 +622,10 @@ class FourChannelSession:
         self._stop_gesture_cycle = next_stop_gesture_cycle
         self._reference_channel = next_reference_channel
         if self._recording_state is RecordingState.RECORDING:
+            if self._stop_mode is not RecordingStopMode.NEXT_GESTURE:
+                self._stop_gestures_remaining = None
+            elif stop_mode is not None or stop_gesture_count is not None:
+                self._stop_gestures_remaining = self._stop_gesture_count
             if self._stop_mode is RecordingStopMode.AFTER_DURATION:
                 if self._recording_start_tick is None:
                     raise RuntimeError("active recording has no start tick")
@@ -870,21 +874,22 @@ class FourChannelSession:
 
     def process_midi_message(self, message: mido.Message, tick: int) -> None:
         self.advance(tick)
+        message_type = getattr(message, "type", None)
         if (
-            message.type == "start"
+            message_type == "start"
             and self._recording_state is RecordingState.WAITING_START
             and self._start_mode is RecordingStartMode.MIDI_TRANSPORT
         ):
             self._begin_recording_window(tick)
         elif (
-            message.type == "stop"
+            message_type == "stop"
             and self._recording_state is RecordingState.RECORDING
             and self._stop_mode is RecordingStopMode.MIDI_TRANSPORT
         ):
             self._finish_recording_window(tick)
         normalized_message = (
             message.copy(channel=0)
-            if getattr(message, "type", None) in ("note_on", "note_off")
+            if message_type in ("note_on", "note_off")
             else message
         )
         voice_event = self.preprocessor.process(

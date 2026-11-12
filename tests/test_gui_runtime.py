@@ -1,20 +1,32 @@
 from __future__ import annotations
 
 import math
+import sys
 import threading
 import time
+from dataclasses import replace
+from types import SimpleNamespace
 
 import mido
 import pytest
 
 from midi_output import CollectingMidiSink
-from py_seq.four_channel_session import FourChannelSession, MidiRoute, ResetMode
+from py_seq.four_channel_session import (
+    FourChannelSession,
+    MidiRoute,
+    RecordingStartMode,
+    RecordingStopMode,
+    ResetMode,
+)
 from py_seq.gui_runtime import (
     FourChannelGuiRuntime,
     GuiCommandQueueFull,
+    GuiIntent,
     GuiIntentKind,
     _MidiClockTempo,
 )
+from py_seq.pygame_gui import _project_recording_toggle, _reconcile_projected_state
+from py_seq import pygame_gui
 from tape import IntervalInsert
 
 
@@ -40,6 +52,311 @@ def make_session() -> tuple[
         MidiRoute("OUT4", 3, sinks[3], 3),
     )
     return FourChannelSession((3840, 4800, 5760, 6720), 120, routes), sinks
+
+
+def test_midi_backlog_is_processed_before_later_recording_stop():
+    now = [0]
+    session, _ = make_session()
+    session.toggle_transport()
+    session.toggle_recording()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: now[0])
+    now[0] = 10_000_000
+    for _ in range(128):
+        runtime.enqueue_midi_message(mido.Message("clock"))
+    runtime.enqueue_midi_message(mido.Message("note_on", note=60, velocity=90))
+    runtime._commands.put_nowait(
+        GuiIntent(1, 20_000_000, GuiIntentKind.RECORDING_TOGGLE)
+    )
+    now[0] = 30_000_000
+    runtime._process_pending()
+
+    assert session.recording_state.name == "IDLE"
+    (interval,) = session.tape(0).intervals()
+    assert (interval.start, interval.duration, interval.pitch) == (19, 19, 60)
+    runtime.close()
+
+
+def test_snapshot_acknowledges_command_even_when_midi_advances_past_projected_state():
+    now = [0]
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: now[0])
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.MIDI_TRANSPORT,
+        stop_mode=RecordingStopMode.MIDI_TRANSPORT,
+    )
+    runtime._commands.put_nowait(GuiIntent(1, 10, GuiIntentKind.RECORDING_TOGGLE))
+    projected = {"recording_state": "WAITING_START", "recording_armed": True}
+    pending = {"recording_state": 1, "recording_armed": 1}
+    _reconcile_projected_state(projected, pending, runtime.get_snapshot())
+    assert projected["recording_state"] == "WAITING_START"
+    now[0] = 20
+    runtime.enqueue_midi_message(mido.Message("start"))
+    now[0] = 30
+    runtime.enqueue_midi_message(mido.Message("stop"))
+    runtime._process_pending()
+
+    snapshot = runtime.get_snapshot()
+    assert snapshot.recording_state == "IDLE"
+    assert snapshot.last_processed_request_id == 1
+    _reconcile_projected_state(projected, pending, snapshot)
+    assert not projected
+    assert (
+        _project_recording_toggle(snapshot.recording_state, snapshot) == "WAITING_START"
+    )
+    runtime.close()
+
+
+def test_snapshot_acknowledges_rejected_command_even_if_notification_overflows():
+    now = [0]
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(
+        session, clock_ns=lambda: now[0], notification_capacity=1
+    )
+    runtime._commands.put_nowait(
+        GuiIntent(1, 0, GuiIntentKind.RECORDING_SYNC, value="start beat")
+    )
+    runtime._commands.put_nowait(
+        GuiIntent(2, 0, GuiIntentKind.RECORDING_SYNC, value="not a command")
+    )
+    runtime._process_pending()
+    snapshot = runtime.get_snapshot()
+    assert snapshot.last_processed_request_id == 2
+    assert snapshot.notification_overflow_count == 1
+    projected: dict[str, object] = {"recording_state": "WAITING_START"}
+    pending = {"recording_state": 2}
+    _reconcile_projected_state(projected, pending, snapshot)
+    assert not projected and not pending
+    runtime.close()
+
+
+def test_projection_waits_for_latest_request_even_if_old_snapshot_matches():
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+    snapshot = runtime.get_snapshot()
+    projected = {
+        "recording_state": "IDLE",
+        "recording_armed": True,
+        "transport_playing": True,
+    }
+    pending = {"recording_state": 2, "recording_armed": 2, "transport_playing": 1}
+    _reconcile_projected_state(projected, pending, snapshot)
+    assert projected["recording_state"] == "IDLE"
+    runtime._commands.put_nowait(
+        GuiIntent(1, 0, GuiIntentKind.TRANSPORT, value=True)
+    )
+    runtime._process_pending()
+    _reconcile_projected_state(projected, pending, runtime.get_snapshot())
+    assert projected == {"recording_state": "IDLE", "recording_armed": True}
+    assert pending == {"recording_state": 2, "recording_armed": 2}
+    runtime._commands.put_nowait(GuiIntent(2, 0, GuiIntentKind.RECORDING_TOGGLE))
+    runtime._process_pending()
+    _reconcile_projected_state(projected, pending, runtime.get_snapshot())
+    assert not projected and not pending
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("stop_mode", "expected"),
+    [
+        ("IMMEDIATE", "IDLE"),
+        ("AFTER_DURATION", "IDLE"),
+        ("NEXT_GESTURE", "IDLE"),
+        ("MIDI_TRANSPORT", "IDLE"),
+        ("NEXT_BEAT", "WAITING_STOP"),
+        ("NEXT_REFERENCE_LOOP_START", "WAITING_STOP"),
+    ],
+)
+def test_recording_projection_matches_manual_stop_semantics(stop_mode, expected):
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+    snapshot = replace(runtime.get_snapshot(), recording_stop_mode=stop_mode)
+    assert _project_recording_toggle("RECORDING", snapshot) == expected
+    runtime.close()
+
+
+def test_gui_discards_projection_when_automatic_transition_skips_waiting_state(
+    monkeypatch,
+):
+    session, _ = make_session()
+    session.configure_recording_sync(start_mode=RecordingStartMode.MIDI_TRANSPORT)
+    real_runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+    initial = real_runtime.get_snapshot()
+    after_command = replace(initial, last_processed_request_id=1)
+
+    class FakeRuntime:
+        lifecycle = "running"
+        shutdown_timeout = 1.0
+        frame = 0
+        next_request_id = 0
+
+        def start(self):
+            pass
+
+        def get_snapshot(self):
+            self.frame += 1
+            return initial if self.frame == 1 else after_command
+
+        def drain_notifications(self):
+            return ()
+
+        def submit(self, kind, **kwargs):
+            self.next_request_id += 1
+            if kind is GuiIntentKind.SHUTDOWN:
+                self.lifecycle = "stopped"
+            return self.next_request_id
+
+        def close(self, timeout=None):
+            pass
+
+    runtime = FakeRuntime()
+    enter = SimpleNamespace(type=1, key=13)
+    quit_event = SimpleNamespace(type=2)
+    events = iter(((enter,), (enter,), (quit_event,)))
+    fake_pygame = SimpleNamespace(
+        QUIT=2,
+        VIDEORESIZE=3,
+        KEYDOWN=1,
+        K_ESCAPE=27,
+        K_q=113,
+        K_r=114,
+        K_SPACE=32,
+        K_TAB=9,
+        K_RETURN=13,
+        K_KP_ENTER=271,
+        K_BACKSPACE=8,
+        K_DELETE=127,
+        K_d=100,
+        RESIZABLE=1,
+        init=lambda: None,
+        quit=lambda: None,
+        display=SimpleNamespace(
+            set_mode=lambda *args: object(),
+            set_caption=lambda text: None,
+            flip=lambda: None,
+        ),
+        font=SimpleNamespace(SysFont=lambda *args, **kwargs: object()),
+        time=SimpleNamespace(Clock=lambda: SimpleNamespace(tick=lambda fps: None)),
+        event=SimpleNamespace(get=lambda: next(events)),
+    )
+    states = []
+    original = pygame_gui._project_recording_toggle
+
+    def observe_toggle(state, snapshot):
+        states.append(state)
+        return original(state, snapshot)
+
+    monkeypatch.setitem(sys.modules, "pygame", fake_pygame)
+    monkeypatch.setattr(pygame_gui, "_draw_ui", lambda *args: None)
+    monkeypatch.setattr(pygame_gui, "_project_recording_toggle", observe_toggle)
+    pygame_gui.run_gui(runtime)  # pyright: ignore[reportArgumentType]
+
+    assert states == ["IDLE", "IDLE"]
+    real_runtime.close()
+
+
+def test_command_backlog_is_processed_before_later_midi_start():
+    now = [0]
+    session, _ = make_session()
+    runtime = FourChannelGuiRuntime(
+        session, clock_ns=lambda: now[0], command_capacity=256
+    )
+    for request_id in range(1, 129):
+        runtime._commands.put_nowait(
+            GuiIntent(
+                request_id,
+                10_000_000,
+                GuiIntentKind.RECORDING_SYNC,
+                value="start transport",
+            )
+        )
+    runtime._commands.put_nowait(
+        GuiIntent(129, 10_000_000, GuiIntentKind.RECORDING_TOGGLE)
+    )
+    now[0] = 20_000_000
+    runtime.enqueue_midi_message(mido.Message("start"))
+    runtime._process_pending()
+
+    assert session.recording_state.name == "RECORDING"
+    runtime.close()
+
+
+def test_batch_capture_waits_for_inflight_midi_timestamp_and_enqueue():
+    timestamp_started = threading.Event()
+    release_timestamp = threading.Event()
+    processing_done = threading.Event()
+
+    def clock():
+        if threading.current_thread().name == "midi-producer":
+            timestamp_started.set()
+            if not release_timestamp.wait(1):
+                raise TimeoutError("MIDI timestamp was not released")
+            return 10_000_000
+        return 30_000_000
+
+    session, _ = make_session()
+    session.toggle_transport()
+    session.toggle_recording()
+    runtime = FourChannelGuiRuntime(session, clock_ns=clock)
+    runtime._clock_origin_ns = 0
+    runtime._commands.put_nowait(
+        GuiIntent(1, 20_000_000, GuiIntentKind.RECORDING_TOGGLE)
+    )
+    producer = threading.Thread(
+        target=runtime.enqueue_midi_message,
+        args=(mido.Message("note_on", note=60, velocity=90),),
+        name="midi-producer",
+    )
+
+    def process():
+        runtime._process_pending()
+        processing_done.set()
+
+    worker = threading.Thread(target=process)
+    producer.start()
+    try:
+        assert timestamp_started.wait(1)
+        worker.start()
+        assert not processing_done.wait(0.05)
+    finally:
+        release_timestamp.set()
+        producer.join(1)
+        if worker.ident is not None:
+            worker.join(1)
+    assert not producer.is_alive()
+    assert not worker.is_alive()
+    assert processing_done.is_set()
+    (interval,) = session.tape(0).intervals()
+    assert (interval.start, interval.duration) == (19, 19)
+    runtime.close()
+
+
+def test_arrivals_during_batch_are_not_overtaken_by_clock_advancement(monkeypatch):
+    now = [0]
+    session, _ = make_session()
+    session.toggle_transport()
+    session.toggle_recording()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: now[0])
+    now[0] = 10_000_000
+    runtime.enqueue_midi_message(mido.Message("clock"))
+    original = session.process_midi_message
+
+    def process_and_enqueue(message, tick):
+        original(message, tick)
+        if message.type == "clock":
+            now[0] = 20_000_000
+            runtime.enqueue_midi_message(
+                mido.Message("note_on", note=60, velocity=90)
+            )
+            now[0] = 30_000_000
+
+    monkeypatch.setattr(session, "process_midi_message", process_and_enqueue)
+    runtime._process_pending()
+    assert session.current_tick == 19
+    runtime._process_pending()
+    session.toggle_recording()
+    (interval,) = session.tape(0).intervals()
+    assert (interval.start, interval.duration) == (38, 19)
+    runtime.close()
 
 
 @pytest.mark.parametrize(("tempo", "expected"), [(119.4, 119), (120.6, 121)])
@@ -222,6 +539,129 @@ def wait_for_notification(runtime: FourChannelGuiRuntime, kind: str):
     raise AssertionError(f"timed out waiting for {kind}")
 
 
+def test_worker_orders_backlogged_midi_and_active_gesture_stop_command(monkeypatch):
+    class ManualClock:
+        def __init__(self):
+            self.value = 0
+            self.lock = threading.Lock()
+
+        def __call__(self):
+            with self.lock:
+                return self.value
+
+        def set(self, value):
+            with self.lock:
+                self.value = value
+
+    session, _ = make_session()
+    clock = ManualClock()
+    entered = threading.Event()
+    release = threading.Event()
+    original = session.process_midi_message
+
+    def blocked_message(message, tick):
+        if not entered.is_set():
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("test did not release MIDI worker")
+        original(message, tick)
+
+    monkeypatch.setattr(session, "process_midi_message", blocked_message)
+    runtime = FourChannelGuiRuntime(session, clock_ns=clock)
+    runtime.start()
+    try:
+        runtime.submit(GuiIntentKind.TRANSPORT, value=True)
+        wait_for_notification(runtime, "command_applied")
+        runtime.submit(GuiIntentKind.RECORDING_ARM, value=True)
+        wait_for_notification(runtime, "command_applied")
+        clock.set(1_000_000)
+        runtime.enqueue_midi_message(mido.Message("clock"))
+        assert entered.wait(1)
+
+        clock.set(10_000_000)
+        for _ in range(128):
+            runtime.enqueue_midi_message(mido.Message("clock"))
+        runtime.enqueue_midi_message(mido.Message("note_on", note=60, velocity=90))
+        clock.set(20_000_000)
+        request = runtime.submit(GuiIntentKind.RECORDING_SYNC, value="stop gesture")
+        clock.set(30_000_000)
+        runtime.enqueue_midi_message(mido.Message("note_off", note=60))
+        release.set()
+
+        notification = wait_for_notification(runtime, "tape_changed")
+        (interval,) = notification.changed_intervals
+        assert (interval.start, interval.duration, interval.pitch) == (19, 38, 60)
+        deadline = time.monotonic() + 1
+        while (
+            runtime.get_snapshot().last_processed_request_id < request
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.002)
+        snapshot = runtime.get_snapshot()
+        assert snapshot.last_processed_request_id == request
+        assert snapshot.recording_state == "IDLE"
+        assert snapshot.transport.playing
+    finally:
+        release.set()
+        runtime.close()
+
+
+def test_gui_reconciles_real_worker_automatic_midi_transitions(monkeypatch):
+    session, _ = make_session()
+    session.configure_recording_sync(
+        start_mode=RecordingStartMode.MIDI_TRANSPORT,
+        stop_mode=RecordingStopMode.MIDI_TRANSPORT,
+    )
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+    enter = SimpleNamespace(type=1, key=13)
+    events = iter(((enter,), (enter,), (SimpleNamespace(type=2),)))
+    states = []
+    original = pygame_gui._project_recording_toggle
+    frames = [0]
+
+    def wait_for_state(state):
+        deadline = time.monotonic() + 1
+        while (
+            runtime.get_snapshot().recording_state != state
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.002)
+        assert runtime.get_snapshot().recording_state == state
+
+    def tick(fps):
+        frames[0] += 1
+        if frames[0] == 1:
+            wait_for_state("WAITING_START")
+            runtime.enqueue_midi_message(mido.Message("start"))
+            wait_for_state("RECORDING")
+            runtime.enqueue_midi_message(mido.Message("stop"))
+            wait_for_state("IDLE")
+
+    def observe_toggle(state, snapshot):
+        states.append(state)
+        return original(state, snapshot)
+
+    fake_pygame = SimpleNamespace(
+        QUIT=2, VIDEORESIZE=3, KEYDOWN=1, K_ESCAPE=27, K_q=113,
+        K_r=114, K_SPACE=32, K_TAB=9, K_RETURN=13, K_KP_ENTER=271,
+        K_BACKSPACE=8, K_DELETE=127, K_d=100, RESIZABLE=1,
+        init=lambda: None,
+        quit=lambda: None,
+        display=SimpleNamespace(
+            set_mode=lambda *args: object(), set_caption=lambda text: None,
+            flip=lambda: None,
+        ),
+        font=SimpleNamespace(SysFont=lambda *args, **kwargs: object()),
+        time=SimpleNamespace(Clock=lambda: SimpleNamespace(tick=tick)),
+        event=SimpleNamespace(get=lambda: next(events, ())),
+    )
+    monkeypatch.setitem(sys.modules, "pygame", fake_pygame)
+    monkeypatch.setattr(pygame_gui, "_draw_ui", lambda *args: None)
+    monkeypatch.setattr(pygame_gui, "_project_recording_toggle", observe_toggle)
+    pygame_gui.run_gui(runtime)
+    assert states == ["IDLE", "IDLE"]
+
+
 def test_runtime_publishes_all_four_lanes_and_transport_snapshot():
     session, _ = make_session()
     runtime = FourChannelGuiRuntime(session)
@@ -251,7 +691,9 @@ def test_runtime_snapshot_represents_uninitialized_loops():
         MidiRoute(f"OUT{index + 1}", index, sinks[index], index)
         for index in range(4)
     )
-    session = FourChannelSession((0, 0, 0, 0), 120, routes)
+    session = FourChannelSession(
+        (0, 0, 0, 0), 120, (routes[0], routes[1], routes[2], routes[3])
+    )
     runtime = FourChannelGuiRuntime(session)
 
     assert tuple(
@@ -266,7 +708,9 @@ def test_runtime_snapshot_marks_a_loop_until_its_definition_is_finalized():
         MidiRoute(f"OUT{index + 1}", index, sinks[index], index)
         for index in range(4)
     )
-    session = FourChannelSession((0, 0, 0, 0), 120, routes)
+    session = FourChannelSession(
+        (0, 0, 0, 0), 120, (routes[0], routes[1], routes[2], routes[3])
+    )
     session.toggle_transport()
     session.set_recording_armed(True)
     session.advance(120)
@@ -976,7 +1420,9 @@ def test_shutdown_cleanup_failure_is_reported_in_terminal_snapshot():
         MidiRoute(f"OUT{index + 1}", index, sink, index)
         for index in range(4)
     )
-    session = FourChannelSession((3840, 3840, 3840, 3840), 120, routes)
+    session = FourChannelSession(
+        (3840, 3840, 3840, 3840), 120, (routes[0], routes[1], routes[2], routes[3])
+    )
     runtime = FourChannelGuiRuntime(session, output_sinks=(sink,))
     runtime.start()
     runtime.close()

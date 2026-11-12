@@ -57,10 +57,14 @@ controls. It also handles live MIDI input, program changes, manual and
 automatic phase resets, and orderly shutdown.
 
 [`playback_coordinator/core.py`](../playback_coordinator/core.py) coordinates
-each channel's recorder, scheduler, articulator, and output. The optional
+each channel's recorder, scheduler, articulator, and output. It accepts a
+non-empty tuple of channels whose recorders all start at the same tick.
+The optional
 [`py_seq/gui_runtime.py`](../py_seq/gui_runtime.py) advances the session on a
-host worker and hands immutable snapshots to the UI. Its clock and playback
-work are independent of GUI rendering.
+host worker and hands immutable snapshots to the UI. Each snapshot identifies
+the latest processed command, allowing the UI to retire optimistic state
+after the corresponding authoritative state is published. Its clock and
+playback work are independent of GUI rendering.
 
 See [`pygame_gui.md`](./pygame_gui.md) for user controls and command syntax.
 Relevant tests are in

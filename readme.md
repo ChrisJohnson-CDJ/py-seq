@@ -18,7 +18,7 @@ fraction. This display does not reduce internal tick precision.
 
 ## Fresh installation
 
-Python 3.12 is required (`.python-version` pins 3.12.3). Create a project virtual environment, then install the project in editable mode. This installs the dependencies declared in `pyproject.toml`, including Mido, python-rtmidi, and pytest.
+Python 3.12 is required (`.python-version` pins 3.12.3). Create a project virtual environment, then install the project in editable mode. This installs the application dependencies Mido and python-rtmidi; testing and development tools are optional.
 
 ### Windows PowerShell
 
@@ -50,10 +50,9 @@ python -m pip install -e .
 
 If `python-rtmidi` cannot install a compatible wheel and pip attempts a source build, install a C/C++ compiler and the system ALSA development headers first. For Debian/Ubuntu these are commonly provided by `build-essential` and `libasound2-dev`; package names vary by distribution. MIDI hardware is not needed to install the project or run its tests.
 
-After installation on either OS, verify the setup with:
+After installation on either OS, verify the application setup with:
 
 ```text
-python -m pytest -q
 python -m py_seq.pygame_gui --help
 ```
 
@@ -88,15 +87,22 @@ and commands.
 
 ## Testing
 
-Use the existing Python 3.12.3 virtual environment:
+Tests use fake clocks, the in-memory diagnostic MIDI output, and mocked Mido
+ports; they do not require MIDI hardware. Some worker and GUI integration tests
+use bounded real-time waits or polling to coordinate threads.
+
+In the project virtual environment, install the GUI and development extras to
+run the local checks:
 
 ```bash
-cd ~/git/py-seq
-. .venv/bin/activate
+python -m pip install -e ".[gui,dev]"
+python -m pyright --pythonpath .venv/bin/python
 python -m pytest -q
 ```
 
-Tests use fake clocks, the in-memory diagnostic MIDI output, and mocked Mido ports. They do not require hardware or real-time sleeps.
+On Windows, replace `.venv/bin/python` in the Pyright command with
+`.venv\Scripts\python.exe`. Pyright uses Node.js; install Node.js locally or
+allow its Python wrapper to provision it.
 
 ## Code boundaries
 
