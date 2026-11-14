@@ -1177,6 +1177,184 @@ def test_runtime_loop_length_command_updates_only_its_channel():
         runtime.close()
 
 
+def test_bpm_command_preserves_loops_and_changes_subsequent_playback_rate():
+    now = [0]
+    session, sinks = make_session()
+    session.tape(0).insert(IntervalInsert(720, 120, 60, 90, 1))
+    session.tape(1).insert(IntervalInsert(720, 120, 62, 90, 2))
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: now[0])
+    before = tuple(tape.snapshot() for tape in session.tapes)
+    phases = tuple(scheduler.phase_origin_tick for scheduler in session.schedulers)
+    runtime._commands.put_nowait(GuiIntent(1, 0, GuiIntentKind.TRANSPORT, value=True))
+    runtime._commands.put_nowait(
+        GuiIntent(2, 250_000_000, GuiIntentKind.TRANSPORT, value=False)
+    )
+    runtime._commands.put_nowait(
+        GuiIntent(3, 300_000_000, GuiIntentKind.BPM_CHANGE, value="bpm 60")
+    )
+    runtime._commands.put_nowait(
+        GuiIntent(4, 400_000_000, GuiIntentKind.TRANSPORT, value=True)
+    )
+    now[0] = 650_000_000
+    runtime._process_pending()
+
+    snapshot = runtime.get_snapshot()
+    assert snapshot.transport.tempo_bpm == 60
+    assert session.current_tick == 720
+    assert tuple(tape.snapshot() for tape in session.tapes) == before
+    assert tuple(scheduler.phase_origin_tick for scheduler in session.schedulers) == phases
+    assert mido.Message("note_on", channel=0, note=60, velocity=90) in sinks[0].messages
+    assert mido.Message("note_on", channel=1, note=62, velocity=90) in sinks[1].messages
+    assert any(
+        notice.request_id == 3 and notice.message == "Tempo set to 60 BPM"
+        for notice in runtime.drain_notifications()
+    )
+    runtime.close()
+
+
+@pytest.mark.parametrize("state", ["running", "RECORDING", "WAITING_START", "WAITING_STOP"])
+def test_bpm_command_rejects_running_or_nonidle_recording(state):
+    session, _ = make_session()
+    if state == "running":
+        session.toggle_transport()
+    elif state == "WAITING_START":
+        session.configure_recording_sync(start_mode=RecordingStartMode.NEXT_BEAT)
+        session.set_recording_armed(True)
+    elif state == "RECORDING":
+        session.set_recording_armed(True)
+    else:
+        session.configure_recording_sync(stop_mode=RecordingStopMode.NEXT_BEAT)
+        session.toggle_transport()
+        session.set_recording_armed(True)
+        session.advance(10)
+        session.request_recording_stop()
+        session.toggle_transport()
+    if state != "running":
+        assert session.recording_state.name == state
+        assert not session.transport_running
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+    runtime._commands.put_nowait(
+        GuiIntent(1, 0, GuiIntentKind.BPM_CHANGE, value="tempo 60")
+    )
+    runtime._process_pending()
+    (notification,) = runtime.drain_notifications()
+    assert notification.kind == "command_rejected"
+    assert "Cannot change BPM" in notification.message
+    assert runtime.get_snapshot().transport.tempo_bpm == 120
+    assert session.bpm == 120
+    runtime.close()
+
+
+def test_bpm_command_preserves_continuous_midi_clock_phase():
+    now = [0]
+    session, sinks = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: now[0])
+    runtime._apply_intent(
+        GuiIntent(1, 0, GuiIntentKind.MIDI_OUTPUT, value="clock on"), 0
+    )
+    runtime._commands.put_nowait(
+        GuiIntent(2, 10_000_000, GuiIntentKind.BPM_CHANGE, value="bpm 60")
+    )
+    now[0] = 20_000_000
+    runtime._process_pending()
+    assert not sinks[0].messages
+    now[0] = 31_666_666
+    runtime._process_pending()
+    assert not sinks[0].messages
+    now[0] = 31_666_667
+    runtime._process_pending()
+    assert sinks[0].messages == [mido.Message("clock")]
+    assert runtime.get_snapshot().midi_clock_active
+    runtime.close()
+
+
+def test_bpm_command_updates_auto_clock_when_transport_resumes():
+    now = [0]
+    session, sinks = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: now[0])
+    runtime._commands.put_nowait(
+        GuiIntent(1, 0, GuiIntentKind.MIDI_OUTPUT, value="clock auto")
+    )
+    runtime._commands.put_nowait(
+        GuiIntent(2, 0, GuiIntentKind.BPM_CHANGE, value="tempo 60")
+    )
+    runtime._commands.put_nowait(
+        GuiIntent(3, 0, GuiIntentKind.TRANSPORT, value=True)
+    )
+    runtime._process_pending()
+    now[0] = 41_666_666
+    runtime._process_pending()
+    assert not sinks[0].messages
+    now[0] = 41_666_667
+    runtime._process_pending()
+    assert sinks[0].messages == [mido.Message("clock")]
+    runtime.close()
+
+
+def test_gui_routes_bpm_and_tempo_commands(monkeypatch):
+    session, _ = make_session()
+    real_runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+    snapshot = real_runtime.get_snapshot()
+    submitted = []
+
+    class FakeRuntime:
+        lifecycle = "running"
+        shutdown_timeout = 1.0
+
+        def start(self):
+            pass
+
+        def get_snapshot(self):
+            return snapshot
+
+        def drain_notifications(self):
+            return ()
+
+        def submit(self, kind, **kwargs):
+            submitted.append((kind, kwargs))
+            if kind is GuiIntentKind.SHUTDOWN:
+                self.lifecycle = "stopped"
+            return len(submitted)
+
+        def close(self, timeout=None):
+            pass
+
+    def command_events(text):
+        return (
+            SimpleNamespace(type=1, key=27),
+            *(SimpleNamespace(type=1, key=0, unicode=char) for char in text),
+            SimpleNamespace(type=1, key=13),
+        )
+
+    events = iter((
+        command_events("bpm 120.5"),
+        command_events("te 60"),
+        command_events("t 60"),
+        (SimpleNamespace(type=2),),
+    ))
+    fake_pygame = SimpleNamespace(
+        QUIT=2, VIDEORESIZE=3, KEYDOWN=1, K_ESCAPE=27, K_q=113,
+        K_r=114, K_SPACE=32, K_TAB=9, K_RETURN=13, K_KP_ENTER=271,
+        K_BACKSPACE=8, K_DELETE=127, K_d=100, K_UP=273, K_DOWN=274,
+        RESIZABLE=1, init=lambda: None, quit=lambda: None,
+        display=SimpleNamespace(
+            set_mode=lambda *args: object(), set_caption=lambda text: None,
+            flip=lambda: None,
+        ),
+        font=SimpleNamespace(SysFont=lambda *args, **kwargs: object()),
+        time=SimpleNamespace(Clock=lambda: SimpleNamespace(tick=lambda fps: None)),
+        event=SimpleNamespace(get=lambda: next(events, ())),
+    )
+    monkeypatch.setitem(sys.modules, "pygame", fake_pygame)
+    monkeypatch.setattr(pygame_gui, "_draw_ui", lambda *args: None)
+    pygame_gui.run_gui(FakeRuntime())  # pyright: ignore[reportArgumentType]
+    bpm_commands = [
+        kwargs["value"] for kind, kwargs in submitted if kind is GuiIntentKind.BPM_CHANGE
+    ]
+    assert bpm_commands == ["bpm 120.5", "te 60"]
+    real_runtime.close()
+
+
 def test_runtime_displays_error_when_clearing_loop_reset_reference():
     session, _ = make_session()
     session.configure_recording_sync(reference_channel=0)

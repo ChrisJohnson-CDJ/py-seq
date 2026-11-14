@@ -48,6 +48,18 @@ def make_session(
     return session, sinks
 
 
+def test_session_limits_initial_and_updated_bpm_to_300():
+    session, _ = make_session()
+    session.set_bpm(300)
+    assert session.bpm == 300
+    with pytest.raises(ValueError, match="300"):
+        session.set_bpm(300.001)
+    assert session.bpm == 300
+    with pytest.raises(ValueError, match="300"):
+        FourChannelSession((960, 960, 960, 960), 300.001, session.routes)
+    session.close()
+
+
 def test_midi_transport_starts_and_commits_recording_at_message_ticks():
     session, _ = make_session((0, 960, 960, 960))
     session.configure_recording_sync(

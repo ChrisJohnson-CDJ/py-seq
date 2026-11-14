@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 
 from .four_channel_session import (
+    MAX_BPM,
     TICKS_PER_BEAT,
     RecordingStartMode,
     RecordingStopMode,
@@ -100,6 +101,21 @@ def parse_length_command(command: str) -> int:
     if length_ticks <= 0:
         raise ValueError("loop length must be greater than zero")
     return length_ticks
+
+
+def parse_bpm_command(command: str) -> float:
+    if not isinstance(command, str):
+        raise TypeError("command must be a string")
+    parts = command.strip().lower().split()
+    if len(parts) != 2:
+        raise ValueError("use 'bpm {value}' or 'tempo {value}'")
+    resolve_keyword(parts[0], ("bpm", "tempo"))
+    if not _NUMERIC_ARGUMENT.fullmatch(parts[1]):
+        raise ValueError(f"BPM must be a number between 1 and {MAX_BPM}")
+    bpm = float(parts[1])
+    if not 1 <= bpm <= MAX_BPM:
+        raise ValueError(f"BPM must be between 1 and {MAX_BPM}")
+    return bpm
 
 
 def parse_midi_output_command(command: str) -> tuple[str, str]:
@@ -257,6 +273,7 @@ def parse_recording_sync_command(command: str) -> RecordingSyncCommand:
 
 
 __all__ = [
+    "parse_bpm_command",
     "parse_length_command",
     "parse_midi_output_command",
     "parse_musical_length",

@@ -23,6 +23,7 @@ from .four_channel_session import (
     ResetMode,
 )
 from .recording_commands import (
+    parse_bpm_command,
     parse_length_command,
     parse_midi_output_command,
     parse_recording_sync_command,
@@ -83,6 +84,7 @@ class GuiIntentKind(Enum):
     RESET = auto()
     RESET_CONFIG = auto()
     LOOP_LENGTH = auto()
+    BPM_CHANGE = auto()
     OVERWRITE = auto()
     CLEAR_TAPE = auto()
     PROGRAM = auto()
@@ -560,6 +562,12 @@ class FourChannelGuiRuntime:
                     current_tick=self.session.current_tick,
                 )
             return
+        if intent.kind is GuiIntentKind.BPM_CHANGE:
+            if not isinstance(intent.value, str):
+                raise TypeError("BPM command must be a string")
+            self.session.set_bpm(parse_bpm_command(intent.value))
+            self._update_tempo(intent.submitted_at_ns)
+            return
         if intent.kind is GuiIntentKind.RECORDING_ARM:
             self.session.set_recording_armed(bool(intent.value))
             return
@@ -925,6 +933,8 @@ class FourChannelGuiRuntime:
         if intent.kind is GuiIntentKind.MIDI_OUTPUT:
             target, mode = parse_midi_output_command(str(intent.value))
             return f"MIDI {target} {mode}"
+        if intent.kind is GuiIntentKind.BPM_CHANGE:
+            return f"Tempo set to {self.session.bpm:g} BPM"
         if intent.kind is GuiIntentKind.RESET:
             return "Musical position reset"
         if intent.kind is GuiIntentKind.RESET_CONFIG:
@@ -998,6 +1008,10 @@ class FourChannelGuiRuntime:
             intent.value, str
         ):
             raise TypeError("MIDI_OUTPUT requires a command string")
+        if intent.kind is GuiIntentKind.BPM_CHANGE and not isinstance(
+            intent.value, str
+        ):
+            raise TypeError("BPM_CHANGE requires a command string")
         if intent.kind is GuiIntentKind.LOOP_LENGTH and not isinstance(
             intent.value, str
         ):

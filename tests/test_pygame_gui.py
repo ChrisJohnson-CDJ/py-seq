@@ -42,6 +42,7 @@ from py_seq.four_channel_session import (
 )
 from py_seq.gui_runtime import GuiNotification
 from py_seq.recording_commands import (
+    parse_bpm_command,
     parse_length_command,
     parse_midi_output_command,
     parse_musical_length,
@@ -103,6 +104,15 @@ def test_gui_parser_rejects_invalid_routes_and_lengths():
     ):
         with pytest.raises(SystemExit):
             parser.parse_args(args)
+
+
+def test_gui_parser_limits_bpm_to_300():
+    parser = build_parser()
+    assert parser.parse_args(["--bpm", "300"]).bpm == 300
+    assert parser.parse_args(["--bpm", "0.5"]).bpm == 0.5
+    for bpm in ("300.001", "999.9", "inf", "0"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--bpm", bpm])
 
 
 def test_gui_opens_each_selected_output_once(monkeypatch):
@@ -275,6 +285,18 @@ def test_midi_output_command_parser_resolves_target_and_mode_prefixes():
         parse_midi_output_command("transport missing")
     with pytest.raises(ValueError, match="use 'transport off"):
         parse_midi_output_command("clock")
+
+
+def test_bpm_command_parser_accepts_aliases_and_rejects_invalid_values():
+    assert parse_bpm_command(" BPM 120.5 ") == 120.5
+    assert parse_bpm_command("te 1") == 1
+    assert parse_bpm_command("b 300") == 300
+    for command in (
+        "bpm", "bpm 0", "bpm -1", "bpm 300.001", "bpm 999.9",
+        "bpm nan", "bpm inf", "bpm 1e2", "bpm 120 60", "clock 120",
+    ):
+        with pytest.raises(ValueError):
+            parse_bpm_command(command)
 
 
 def test_recording_sync_command_parser_supports_modes_and_reference_channel():

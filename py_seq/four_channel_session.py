@@ -18,6 +18,7 @@ from tape import Tape
 
 TICKS_PER_BEAT = 960
 CHANNEL_COUNT = 4
+MAX_BPM = 300
 
 
 class RecordingStartMode(Enum):
@@ -56,6 +57,16 @@ def _validate_tick(tick: object) -> int:
     if tick < 0:
         raise ValueError("tick must be nonnegative")
     return tick
+
+
+def _validate_bpm(bpm: object) -> float:
+    if isinstance(bpm, bool) or not isinstance(bpm, (int, float)):
+        raise TypeError("bpm must be a number")
+    if not math.isfinite(bpm) or bpm <= 0:
+        raise ValueError("bpm must be a finite number greater than zero")
+    if bpm > MAX_BPM:
+        raise ValueError(f"bpm must not exceed {MAX_BPM}")
+    return float(bpm)
 
 
 @dataclass(frozen=True)
@@ -100,16 +111,13 @@ class FourChannelSession:
             for length in lengths_ticks
         ):
             raise ValueError("loop lengths must be nonnegative integers")
-        if isinstance(bpm, bool) or not isinstance(bpm, (int, float)):
-            raise TypeError("bpm must be a number")
-        if not math.isfinite(bpm) or bpm <= 0:
-            raise ValueError("bpm must be a finite number greater than zero")
+        bpm = _validate_bpm(bpm)
         if len(routes) != CHANNEL_COUNT or not all(
             isinstance(route, MidiRoute) for route in routes
         ):
             raise ValueError("routes must contain four MidiRoute values")
 
-        self.bpm = float(bpm)
+        self.bpm = bpm
         self.routes = routes
         self.programs = [0] * CHANNEL_COUNT
         self.bank_msbs = [0] * CHANNEL_COUNT
@@ -194,6 +202,14 @@ class FourChannelSession:
     @property
     def recording_state(self) -> RecordingState:
         return self._recording_state
+
+    def set_bpm(self, bpm: float) -> None:
+        bpm = _validate_bpm(bpm)
+        if self.transport_running:
+            raise RuntimeError("Cannot change BPM while transport is running")
+        if self.recording_state is not RecordingState.IDLE:
+            raise RuntimeError("Cannot change BPM while recording is active or pending")
+        self.bpm = bpm
 
     @property
     def loop_definition_channel(self) -> int | None:

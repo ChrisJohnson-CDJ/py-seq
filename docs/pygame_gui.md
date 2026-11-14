@@ -39,13 +39,15 @@ unknown prefixes list the valid choices for that position. For example,
 `sta ges 6` is equivalent to `start gesture 6`, and `sto ges 5 cyc` is
 equivalent to `stop gesture 5 cyc`; `st` is ambiguous between `start` and
 `stop`. Prefix matching applies only to command keywords, not counts, musical
-lengths, channel numbers, or MIDI port names.
+lengths, channel numbers, or MIDI port names. `t` is ambiguous between
+`tempo` and `transport`; use `te` or `tr`.
 
 | Command | Action |
 | --- | --- |
 | `pNNN` | Send a program change, from `000` to `127` |
 | `pBBB:PPP` | Send bank MSB and program, each from `000` to `127` |
 | `length {beats}[+{n}[/{m}]]` | Set the selected empty channel's loop length |
+| `bpm {value}` or `tempo {value}` | Set playback tempo in beats per minute |
 | `start immediate` | Begin recording as soon as armed |
 | `start beat` | Begin at the next eligible beat boundary from the current origin |
 | `start beat N` | Align to the next eligible beat, then wait `N` complete beats |
@@ -125,6 +127,14 @@ transport, an empty selected channel, and no active or pending recording on
 that channel. It preserves that channel's phase origin and does not reset
 musical position or change other channels. Resizing loops containing notes is
 not supported.
+
+The `bpm` and `tempo` commands accept values from 1 to 300 BPM, including
+fractional values. The `--bpm` startup option accepts positive values up to
+300 BPM. The commands require stopped application transport and idle
+recording, with no active or waiting recording. Recorded loop lengths,
+note offsets, and phases remain unchanged; their playback speed changes.
+Outgoing `clock on` may remain active and changes rate without restarting its
+clock phase. Outgoing transport mode is independent of this restriction.
 
 The **R** key performs one immediate reset without changing the configured
 automatic reset mode. A reset commits active recording at the reset tick,

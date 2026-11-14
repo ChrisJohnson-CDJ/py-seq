@@ -17,11 +17,13 @@ from midi_output import CollectingMidiSink, MidoOutputPortSink
 
 from .four_channel_session import (
     CHANNEL_COUNT,
+    MAX_BPM,
     TICKS_PER_BEAT,
     FourChannelSession,
     MidiRoute,
 )
 from .recording_commands import (
+    parse_bpm_command,
     parse_length_command,
     parse_midi_output_command,
     parse_recording_sync_command,
@@ -239,6 +241,8 @@ def _positive_bpm(value: str) -> float:
         raise argparse.ArgumentTypeError("must be a number") from error
     if not isfinite(result) or result <= 0:
         raise argparse.ArgumentTypeError("must be a finite number greater than zero")
+    if result > MAX_BPM:
+        raise argparse.ArgumentTypeError(f"must not exceed {MAX_BPM} BPM")
     return result
 
 
@@ -327,7 +331,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("CH1", "CH2", "CH3", "CH4"),
         help="initial loop lengths in beats (default: define while recording)",
     )
-    parser.add_argument("--bpm", type=_positive_bpm, default=10.0, help="tempo in BPM")
+    parser.add_argument(
+        "--bpm", type=_positive_bpm, default=10.0,
+        help=f"tempo in BPM (greater than 0 and at most {MAX_BPM})",
+    )
     parser.add_argument(
         "--fps",
         type=positive_int,
@@ -932,6 +939,8 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                             "reference",
                                             "transport",
                                             "clock",
+                                            "bpm",
+                                            "tempo",
                                         ),
                                     )
                                 if command_word == "reset":
@@ -963,6 +972,12 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                     parse_midi_output_command(command_text)
                                     request_id = submit_projected(
                                         GuiIntentKind.MIDI_OUTPUT,
+                                        value=command_text,
+                                    )
+                                elif command_word in ("bpm", "tempo"):
+                                    parse_bpm_command(command_text)
+                                    request_id = submit_projected(
+                                        GuiIntentKind.BPM_CHANGE,
                                         value=command_text,
                                     )
                                 else:
