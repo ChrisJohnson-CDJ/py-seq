@@ -13,6 +13,7 @@ from py_seq.gui_runtime import (
     GuiTransportSnapshot,
 )
 from py_seq.pygame_gui import (
+    CommandHistory,
     GuiCommandError,
     GRID,
     LOOP_BOUNDARY,
@@ -45,6 +46,7 @@ from py_seq.recording_commands import (
     parse_musical_length,
     parse_recording_sync_command,
     parse_reset_command,
+    resolve_keyword,
 )
 from tape import VoiceInterval
 
@@ -168,11 +170,105 @@ def test_program_command_parser_supports_program_and_bank_msb_only():
             parse_program_command(command)
 
 
+def test_command_history_tracks_only_applied_commands_and_suppresses_adjacent_duplicates():
+    history = CommandHistory()
+    history.add("   ")
+    assert history.commands == ()
+    history.submitted(1, "start gesture")
+    assert history.commands == ()
+    history.rejected(1)
+    assert history.commands == ()
+
+    history.submitted(2, " start gesture ")
+    history.applied(2)
+    history.submitted(3, " start gesture ")
+    history.applied(3)
+    history.submitted(4, "stop gesture")
+    history.applied(4)
+    history.submitted(5, " start gesture ")
+    history.applied(5)
+
+    assert history.commands == (
+        " start gesture ",
+        "stop gesture",
+        " start gesture ",
+    )
+
+
+def test_command_history_navigation_preserves_draft_and_edits_recalled_text():
+    history = CommandHistory()
+    history.add("first")
+    history.add("second")
+
+    assert history.previous("") == "second"
+    assert history.previous("edited second") == "first"
+    assert history.previous("edited first") == "first"
+    assert history.next("edited first") == "second"
+    assert history.next("edited second") == ""
+    assert history.next("draft") == "draft"
+    assert history.commands == ("first", "second")
+
+    assert history.previous("new draft") == "second"
+    history.reset_navigation()
+    assert history.previous("fresh draft") == "second"
+    assert history.next("edited second") == "fresh draft"
+
+
+def test_command_history_empty_boundaries_capacity_and_session_reset():
+    empty = CommandHistory()
+    assert empty.previous("draft") == "draft"
+    assert empty.next("draft") == "draft"
+
+    history = CommandHistory()
+    for index in range(51):
+        history.add(f"command {index}")
+    assert len(history.commands) == 50
+    assert history.commands[0] == "command 1"
+    assert history.commands[-1] == "command 50"
+
+    restarted_application = CommandHistory()
+    assert restarted_application.commands == ()
+
+
+def test_command_keyword_resolution_is_exact_first_and_contextual():
+    keywords = ("start", "stop")
+    assert resolve_keyword("start", keywords) == "start"
+    assert resolve_keyword("sta", keywords) == "start"
+    assert resolve_keyword("cy", ("cycle",)) == "cycle"
+    with pytest.raises(ValueError, match="Ambiguous keyword 'st'.*start, stop"):
+        resolve_keyword("st", keywords)
+    with pytest.raises(ValueError, match="Unknown keyword 'xyz'.*start, stop"):
+        resolve_keyword("xyz", keywords)
+
+    assert parse_reset_command("reset b").mode is ResetMode.BEAT
+    assert parse_length_command("len 3+3/8") == parse_length_command("length 3+3/8")
+    assert (
+        parse_recording_sync_command("sta ges 6")
+        == parse_recording_sync_command("start gesture 6")
+    )
+    assert (
+        parse_recording_sync_command("sto ges 5 cyc")
+        == parse_recording_sync_command("stop gesture 5 cyc")
+    )
+    assert (
+        parse_recording_sync_command("sto a 4")
+        == parse_recording_sync_command("stop after 4")
+    )
+    with pytest.raises(ValueError, match="Ambiguous keyword 'st'"):
+        parse_recording_sync_command("st beat")
+    with pytest.raises(ValueError, match="expected one of: immediate, beat, gesture"):
+        parse_recording_sync_command("start xyz")
+    with pytest.raises(ValueError, match="positive whole number"):
+        parse_recording_sync_command("start gesture 0")
+    with pytest.raises(ValueError, match="positive whole number"):
+        parse_recording_sync_command("stop gesture 1.5")
+
+
 def test_recording_sync_command_parser_supports_modes_and_reference_channel():
     assert parse_recording_sync_command(" start beat ") == parse_recording_sync_command(
         "START BEAT"
     )
-    with pytest.raises(ValueError, match="invalid start mode"):
+    with pytest.raises(ValueError, match="Unknown keyword 'note'"):
         parse_recording_sync_command("start note")
     assert (
         parse_recording_sync_command("stop loop").stop_mode
@@ -231,6 +327,14 @@ def test_recording_sync_command_parser_supports_modes_and_reference_channel():
         "stop gesture cyc"
     ).stop_gesture_cycle
     assert parse_recording_sync_command(
+        "stop gesture cy"
+    ).stop_gesture_cycle
+    assert (
+        parse_recording_sync_command("stop gesture 5 cy")
+        == parse_recording_sync_command("stop gesture 5 cyc")
+        == parse_recording_sync_command("stop gesture 5 cycle")
+    )
+    assert parse_recording_sync_command(
         "stop gesture 3 cyc"
     ).stop_gesture_count == 3
     assert parse_recording_sync_command(
@@ -241,11 +345,11 @@ def test_recording_sync_command_parser_supports_modes_and_reference_channel():
 
     with pytest.raises(ValueError, match="between 1 and 4"):
         parse_recording_sync_command("reference 5")
-    with pytest.raises(ValueError, match="invalid stop mode"):
+    with pytest.raises(ValueError, match="Unknown keyword 'note'"):
         parse_recording_sync_command("stop note")
-    with pytest.raises(ValueError, match="invalid start mode"):
+    with pytest.raises(ValueError, match="Unknown keyword 'bar'"):
         parse_recording_sync_command("start bar")
-    with pytest.raises(ValueError, match="invalid stop mode"):
+    with pytest.raises(ValueError, match="Unknown keyword 'bar'"):
         parse_recording_sync_command("stop bar")
     for command in (
         "start beat 0",

@@ -26,6 +26,21 @@ controlled by GUI redraws.
 
 Press **Esc**, type a command, and press **Enter**.
 
+While entering a command, **Up** and **Down** browse commands successfully
+applied during the current application session. The history retains the most
+recent 50 original command strings, suppresses consecutive duplicates, and
+restores the current draft when moving past the newest entry. Recalled commands
+can be edited; edits do not change saved entries. Rejected commands are not
+added, and history is cleared when the application restarts.
+
+Command keywords accept unique prefixes in their current grammar context.
+Exact keywords take precedence; ambiguous prefixes report their matches, and
+unknown prefixes list the valid choices for that position. For example,
+`sta ges 6` is equivalent to `start gesture 6`, and `sto ges 5 cyc` is
+equivalent to `stop gesture 5 cyc`; `st` is ambiguous between `start` and
+`stop`. Prefix matching applies only to command keywords, not counts, musical
+lengths, channel numbers, or MIDI port names.
+
 | Command | Action |
 | --- | --- |
 | `pNNN` | Send a program change, from `000` to `127` |
@@ -41,7 +56,7 @@ Press **Esc**, type a command, and press **Enter**.
 | `stop beat` | Stop at the next eligible beat boundary from the current origin |
 | `stop after {beats}[+{n}[/{m}]]` | Stop after this duration from recording start |
 | `stop gesture [N]` | Automatically stop after the next or `N`th incoming gesture ends |
-| `stop gesture [N] cycle` / `stop gesture [N] cyc` | Record through the `N`th gesture end, then stop at the next incoming gesture start |
+| `stop gesture [N] cycle` (also `cyc` or `cy`) | Record through the `N`th gesture end, then stop at the next incoming gesture start |
 | `stop loop` | Stop at the next wrap of the reference channel |
 | `stop transport` | Automatically stop on an incoming MIDI Stop message |
 | `reference N` | Select reference channel `1`-`4` for loop-synchronized start/stop |

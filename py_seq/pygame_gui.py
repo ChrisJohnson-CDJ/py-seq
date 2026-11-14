@@ -25,6 +25,7 @@ from .recording_commands import (
     parse_length_command,
     parse_recording_sync_command,
     parse_reset_command,
+    resolve_keyword,
 )
 from .gui_runtime import (
     FourChannelGuiRuntime,
@@ -75,6 +76,62 @@ class GuiCommandError(ValueError):
 class ParsedProgramCommand:
     bank_msb: int | None
     program: int
+
+
+class CommandHistory:
+    def __init__(self) -> None:
+        self._commands: list[str] = []
+        self._pending: dict[int, str] = {}
+        self._position: int | None = None
+        self._draft = ""
+
+    @property
+    def commands(self) -> tuple[str, ...]:
+        return tuple(self._commands)
+
+    def reset_navigation(self) -> None:
+        self._position = None
+        self._draft = ""
+
+    def add(self, command: str) -> None:
+        if not command.strip():
+            return
+        if self._commands and self._commands[-1] == command:
+            return
+        self._commands.append(command)
+        if len(self._commands) > 50:
+            del self._commands[0]
+
+    def submitted(self, request_id: int, command: str) -> None:
+        self._pending[request_id] = command
+
+    def applied(self, request_id: int | None) -> None:
+        if request_id is not None:
+            command = self._pending.pop(request_id, None)
+            if command is not None:
+                self.add(command)
+
+    def rejected(self, request_id: int | None) -> None:
+        if request_id is not None:
+            self._pending.pop(request_id, None)
+
+    def previous(self, current_text: str) -> str:
+        if not self._commands:
+            return current_text
+        if self._position is None:
+            self._draft = current_text
+            self._position = len(self._commands)
+        self._position = max(0, self._position - 1)
+        return self._commands[self._position]
+
+    def next(self, current_text: str) -> str:
+        if self._position is None:
+            return current_text
+        if self._position < len(self._commands) - 1:
+            self._position += 1
+            return self._commands[self._position]
+        self._position = None
+        return self._draft
 
 
 def parse_program_command(command: str) -> ParsedProgramCommand:
@@ -743,6 +800,7 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
         clock = pygame.time.Clock()
         command_mode = False
         command_text = ""
+        command_history = CommandHistory()
         show_seconds = False
         closing = False
         status_text = "Ready"
@@ -777,6 +835,10 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
             now_ns = time.monotonic_ns()
             snapshot = runtime.get_snapshot()
             for notification in runtime.drain_notifications():
+                if notification.kind == "command_applied":
+                    command_history.applied(notification.request_id)
+                elif notification.kind == "command_rejected":
+                    command_history.rejected(notification.request_id)
                 candidate_text, candidate_until, candidate_severity = _handle_notification(
                     notification,
                     snapshot,
@@ -831,8 +893,13 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                         if event.key == pygame.K_ESCAPE:
                             command_mode = False
                             command_text = ""
+                            command_history.reset_navigation()
                             status_text = "Command cancelled"
                             status_until = time.monotonic() + 2
+                        elif event.key == pygame.K_UP:
+                            command_text = command_history.previous(command_text)
+                        elif event.key == pygame.K_DOWN:
+                            command_text = command_history.next(command_text)
                         elif event.key == pygame.K_BACKSPACE:
                             command_text = command_text[:-1]
                         elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
@@ -841,9 +908,28 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                     maxsplit=1
                                 )
                                 command_word = command_parts[0] if command_parts else ""
+                                is_program_command = (
+                                    command_word == "p"
+                                    or (
+                                        command_word.startswith("p")
+                                        and len(command_word) > 1
+                                        and command_word[1].isdigit()
+                                    )
+                                )
+                                if command_word and not is_program_command:
+                                    command_word = resolve_keyword(
+                                        command_word,
+                                        (
+                                            "reset",
+                                            "length",
+                                            "start",
+                                            "stop",
+                                            "reference",
+                                        ),
+                                    )
                                 if command_word == "reset":
                                     parse_reset_command(command_text)
-                                    submit_projected(
+                                    request_id = submit_projected(
                                         GuiIntentKind.RESET_CONFIG,
                                         value=command_text,
                                     )
@@ -855,14 +941,14 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                     )
                                     if not isinstance(selected, str):
                                         selected = snapshot.selected_channel_id
-                                    submit_projected(
+                                    request_id = submit_projected(
                                         GuiIntentKind.LOOP_LENGTH,
                                         channel_id=selected,
                                         value=command_text,
                                     )
                                 elif command_word in ("start", "stop", "reference"):
                                     parse_recording_sync_command(command_text)
-                                    submit_projected(
+                                    request_id = submit_projected(
                                         GuiIntentKind.RECORDING_SYNC,
                                         value=command_text,
                                     )
@@ -875,18 +961,19 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                     if not isinstance(selected, str):
                                         selected = snapshot.selected_channel_id
                                     if parsed.bank_msb is None:
-                                        submit_projected(
+                                        request_id = submit_projected(
                                             GuiIntentKind.PROGRAM,
                                             channel_id=selected,
                                             value=parsed.program,
                                         )
                                     else:
-                                        submit_projected(
+                                        request_id = submit_projected(
                                             GuiIntentKind.BANK_PROGRAM,
                                             channel_id=selected,
                                             value=parsed.program,
                                             bank_msb=parsed.bank_msb,
                                         )
+                                command_history.submitted(request_id, command_text)
                             except (
                                 GuiCommandError,
                                 GuiCommandQueueFull,
@@ -901,6 +988,7 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                 closing = True
                             command_mode = False
                             command_text = ""
+                            command_history.reset_navigation()
                         else:
                             character = getattr(event, "unicode", "")
                             if character.isascii() and character.isprintable():
@@ -911,6 +999,7 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                         if event.key == pygame.K_ESCAPE:
                             command_mode = True
                             command_text = ""
+                            command_history.reset_navigation()
                         elif event.key == pygame.K_q:
                             closing = True
                         elif event.key == pygame.K_r:

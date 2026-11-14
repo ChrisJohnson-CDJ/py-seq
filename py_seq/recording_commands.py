@@ -11,7 +11,27 @@ from .four_channel_session import (
 )
 
 _MUSICAL_LENGTH = re.compile(r"([0-9]+)(?:\+([0-9]+)(?:/([0-9]+))?)?\Z")
+_NUMERIC_ARGUMENT = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)\Z")
 _SUPPORTED_LENGTH_DENOMINATORS = {2, 4, 8, 16, 32, 64}
+
+
+def resolve_keyword(token: str, keywords: tuple[str, ...]) -> str:
+    if token in keywords:
+        return token
+    if not token:
+        raise ValueError(
+            f"Unknown keyword ''; expected one of: {', '.join(keywords)}"
+        )
+    matches = tuple(keyword for keyword in keywords if keyword.startswith(token))
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise ValueError(
+            f"Ambiguous keyword '{token}'; matches: {', '.join(matches)}"
+        )
+    raise ValueError(
+        f"Unknown keyword '{token}'; expected one of: {', '.join(keywords)}"
+    )
 
 
 @dataclass(frozen=True)
@@ -72,7 +92,9 @@ def parse_length_command(command: str) -> int:
     if not isinstance(command, str):
         raise TypeError("command must be a string")
     parts = command.strip().lower().split()
-    if len(parts) != 2 or parts[0] != "length":
+    if parts:
+        parts[0] = resolve_keyword(parts[0], ("length",))
+    if len(parts) != 2:
         raise ValueError("use 'length {beats}[+{n}[/{m}]]'")
     length_ticks = parse_musical_length(parts[1])
     if length_ticks <= 0:
@@ -84,6 +106,10 @@ def parse_reset_command(command: str) -> ResetCommand:
     if not isinstance(command, str):
         raise TypeError("command must be a string")
     parts = command.strip().lower().split()
+    if parts:
+        parts[0] = resolve_keyword(parts[0], ("reset",))
+    if len(parts) > 1:
+        parts[1] = resolve_keyword(parts[1], ("off", "beat", "loop"))
     if parts == ["reset", "off"]:
         return ResetCommand(ResetMode.OFF)
     if parts == ["reset", "loop"]:
@@ -106,6 +132,15 @@ def parse_recording_sync_command(command: str) -> RecordingSyncCommand:
     if not isinstance(command, str):
         raise TypeError("command must be a string")
     parts = command.strip().lower().split()
+    if parts:
+        parts[0] = resolve_keyword(parts[0], ("start", "stop", "reference"))
+    if len(parts) > 1 and parts[0] in ("start", "stop"):
+        modes = (
+            ("immediate", "beat", "gesture", "loop", "transport")
+            if parts[0] == "start"
+            else ("immediate", "beat", "after", "gesture", "loop", "transport")
+        )
+        parts[1] = resolve_keyword(parts[1], modes)
     if len(parts) == 2 and parts[0] == "reference":
         try:
             channel = int(parts[1])
@@ -129,7 +164,13 @@ def parse_recording_sync_command(command: str) -> RecordingSyncCommand:
 
     if parts[:2] == ["stop", "gesture"]:
         suffix = parts[2:]
-        cycle = bool(suffix and suffix[-1] in ("cycle", "cyc"))
+        if suffix and _NUMERIC_ARGUMENT.fullmatch(suffix[-1]) is None:
+            suffix[-1] = (
+                "cycle"
+                if suffix[-1] == "cyc"
+                else resolve_keyword(suffix[-1], ("cycle",))
+            )
+        cycle = bool(suffix and suffix[-1] == "cycle")
         count_parts = suffix[:-1] if cycle else suffix
         if len(count_parts) > 1:
             raise ValueError("use 'stop gesture [N] [cycle|cyc]'")
@@ -209,4 +250,5 @@ __all__ = [
     "ResetCommand",
     "parse_recording_sync_command",
     "parse_reset_command",
+    "resolve_keyword",
 ]
