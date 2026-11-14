@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -251,25 +252,39 @@ class FourChannelSession:
     def phase_origin_tick(self, channel: int) -> int:
         return self.schedulers[self._channel_index(channel)].phase_origin_tick
 
-    def advance(self, tick: int) -> None:
+    def advance(
+        self,
+        tick: int,
+        *,
+        on_reset: Callable[[int], None] | None = None,
+    ) -> None:
         tick = _validate_tick(tick)
         if tick < self.current_tick:
             raise ValueError("tick must be nondecreasing")
-        self._process_boundaries(tick, inclusive=True)
+        self._process_boundaries(
+            tick, inclusive=True, on_reset=on_reset
+        )
         self._advance_transport_to(tick)
         if self.transport_running:
             self._mark_beat_boundaries_processed(tick)
 
-    def reset(self, tick: int) -> None:
+    def reset(
+        self,
+        tick: int,
+        *,
+        on_reset: Callable[[int], None] | None = None,
+    ) -> None:
         """Immediately reset musical position and all loop phases at ``tick``."""
         tick = _validate_tick(tick)
         if tick < self.current_tick:
             raise ValueError("tick must be nondecreasing")
-        self._process_boundaries(tick, inclusive=False)
+        self._process_boundaries(
+            tick, inclusive=False, on_reset=on_reset
+        )
         if self._last_automatic_reset_tick == tick:
             return
         coincides_with_reset = self._next_reset_tick == tick
-        self._execute_reset(tick)
+        self._execute_reset(tick, on_reset=on_reset)
         if coincides_with_reset:
             self._last_automatic_reset_tick = tick
             self._schedule_next_reset(tick)
@@ -307,7 +322,13 @@ class FourChannelSession:
         self._reset_interval_ticks = interval_ticks if mode is ResetMode.BEAT else None
         self._schedule_next_reset(self.current_tick)
 
-    def _process_boundaries(self, tick: int, *, inclusive: bool) -> None:
+    def _process_boundaries(
+        self,
+        tick: int,
+        *,
+        inclusive: bool,
+        on_reset: Callable[[int], None] | None = None,
+    ) -> None:
         limit = tick if inclusive else tick - 1
         while limit >= self.current_tick:
             self._validate_pending_reference()
@@ -329,7 +350,9 @@ class FourChannelSession:
             if reset_tick is not None and (
                 recording_tick is None or reset_tick <= recording_tick
             ):
-                self._execute_reset(reset_tick, automatic=True)
+                self._execute_reset(
+                    reset_tick, automatic=True, on_reset=on_reset
+                )
                 continue
 
             assert recording_tick is not None
@@ -349,7 +372,13 @@ class FourChannelSession:
             else:
                 raise RuntimeError("recording boundary has no pending transition")
 
-    def _execute_reset(self, tick: int, *, automatic: bool = False) -> None:
+    def _execute_reset(
+        self,
+        tick: int,
+        *,
+        automatic: bool = False,
+        on_reset: Callable[[int], None] | None = None,
+    ) -> None:
         disarm_channels: tuple[int, ...] = ()
         if self._recording_state in (
             RecordingState.RECORDING,
@@ -367,8 +396,15 @@ class FourChannelSession:
         self._clear_recording_request()
         if automatic:
             self._last_automatic_reset_tick = tick
+        before_reset = None
+        if on_reset is not None:
+            before_reset = lambda: on_reset(tick)
         try:
-            self.coordinator.reset_phases(tick, disarm_channels=disarm_channels)
+            self.coordinator.reset_phases(
+                tick,
+                disarm_channels=disarm_channels,
+                before_reset=before_reset,
+            )
         finally:
             self._schedule_next_reset(tick)
         if self.transport_running:
@@ -872,8 +908,14 @@ class FourChannelSession:
         self.bank_msbs[self.active_channel] = bank_msb
         self.programs[self.active_channel] = program
 
-    def process_midi_message(self, message: mido.Message, tick: int) -> None:
-        self.advance(tick)
+    def process_midi_message(
+        self,
+        message: mido.Message,
+        tick: int,
+        *,
+        on_reset: Callable[[int], None] | None = None,
+    ) -> None:
+        self.advance(tick, on_reset=on_reset)
         message_type = getattr(message, "type", None)
         if (
             message_type == "start"

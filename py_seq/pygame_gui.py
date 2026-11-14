@@ -23,6 +23,7 @@ from .four_channel_session import (
 )
 from .recording_commands import (
     parse_length_command,
+    parse_midi_output_command,
     parse_recording_sync_command,
     parse_reset_command,
     resolve_keyword,
@@ -203,7 +204,11 @@ def _footer_lines(
     configuration = (
         f"BEAT {_format_beat_position(display_beats)}  REC {snapshot.recording_state}  "
         f"START {start_mode}  STOP {stop_mode}  REF {reference}  "
-        f"RESET {_reset_mode_label(snapshot)}"
+        f"RESET {_reset_mode_label(snapshot)}  "
+        f"MIDI TRN {snapshot.midi_transport_mode}/"
+        f"{'PENDING' if snapshot.midi_transport_start_pending else 'ON' if snapshot.midi_transport_active else 'OFF'}  "
+        f"CLK {snapshot.midi_clock_mode}/"
+        f"{'ON' if snapshot.midi_clock_active else 'OFF'}"
     )
     status = f"> {command_text}" if command_mode else status_text
     return configuration, status
@@ -925,6 +930,8 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                             "start",
                                             "stop",
                                             "reference",
+                                            "transport",
+                                            "clock",
                                         ),
                                     )
                                 if command_word == "reset":
@@ -950,6 +957,12 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                     parse_recording_sync_command(command_text)
                                     request_id = submit_projected(
                                         GuiIntentKind.RECORDING_SYNC,
+                                        value=command_text,
+                                    )
+                                elif command_word in ("transport", "clock"):
+                                    parse_midi_output_command(command_text)
+                                    request_id = submit_projected(
+                                        GuiIntentKind.MIDI_OUTPUT,
                                         value=command_text,
                                     )
                                 else:

@@ -43,6 +43,7 @@ from py_seq.four_channel_session import (
 from py_seq.gui_runtime import GuiNotification
 from py_seq.recording_commands import (
     parse_length_command,
+    parse_midi_output_command,
     parse_musical_length,
     parse_recording_sync_command,
     parse_reset_command,
@@ -262,6 +263,18 @@ def test_command_keyword_resolution_is_exact_first_and_contextual():
         parse_recording_sync_command("start gesture 0")
     with pytest.raises(ValueError, match="positive whole number"):
         parse_recording_sync_command("stop gesture 1.5")
+
+
+def test_midi_output_command_parser_resolves_target_and_mode_prefixes():
+    assert parse_midi_output_command("trans aut") == ("transport", "auto")
+    assert parse_midi_output_command("cloc on") == ("clock", "on")
+    assert parse_midi_output_command("clock off") == ("clock", "off")
+    with pytest.raises(ValueError, match="Ambiguous keyword 'o'.*off, on"):
+        parse_midi_output_command("clock o")
+    with pytest.raises(ValueError, match="Unknown keyword 'missing'"):
+        parse_midi_output_command("transport missing")
+    with pytest.raises(ValueError, match="use 'transport off"):
+        parse_midi_output_command("clock")
 
 
 def test_recording_sync_command_parser_supports_modes_and_reference_channel():
@@ -537,7 +550,7 @@ def test_gui_footer_keeps_recording_configuration_separate_from_status():
 
     assert configuration == (
         "BEAT 1:00  REC WAITING_STOP  START BEAT  STOP LOOP  "
-        "REF channel-1  RESET OFF"
+        "REF channel-1  RESET OFF  MIDI TRN OFF/OFF  CLK OFF/OFF"
     )
     assert status == "Channel cleared"
     assert not any(

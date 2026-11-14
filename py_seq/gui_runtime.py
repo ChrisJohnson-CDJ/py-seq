@@ -14,6 +14,8 @@ from typing import Protocol
 import mido
 
 from interval_resolver import RecordMode
+from midi_output import MidiMessageSink
+from .midi_realtime import MidiOutputMode, MidiRealtimeOutput
 from .four_channel_session import (
     CHANNEL_COUNT,
     TICKS_PER_BEAT,
@@ -22,6 +24,7 @@ from .four_channel_session import (
 )
 from .recording_commands import (
     parse_length_command,
+    parse_midi_output_command,
     parse_recording_sync_command,
     parse_reset_command,
 )
@@ -84,6 +87,7 @@ class GuiIntentKind(Enum):
     CLEAR_TAPE = auto()
     PROGRAM = auto()
     BANK_PROGRAM = auto()
+    MIDI_OUTPUT = auto()
     SHUTDOWN = auto()
 
 
@@ -152,6 +156,11 @@ class GuiSnapshot:
     midi_in_bpm: int | None = None
     midi_in_no_clock: bool = False
     last_processed_request_id: int = 0
+    midi_transport_mode: str = "OFF"
+    midi_transport_active: bool = False
+    midi_transport_start_pending: bool = False
+    midi_clock_mode: str = "OFF"
+    midi_clock_active: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +247,20 @@ class FourChannelGuiRuntime:
         ]
         self._clock_origin_ns = clock_ns()
         self._midi_clock_tempo = _MidiClockTempo()
-        self._tick_origin = session.current_tick
+        self._tick_origin = float(session.current_tick)
+        self._tempo_bpm = session.bpm
+        output_routes: list[MidiMessageSink] = []
+        seen_sinks: set[int] = set()
+        for route in session.routes:
+            if route.port_index is not None and id(route.sink) not in seen_sinks:
+                seen_sinks.add(id(route.sink))
+                output_routes.append(route.sink)
+        self._midi_realtime = MidiRealtimeOutput(
+            tuple(output_routes),
+            now_ns=self._clock_origin_ns,
+            bpm=session.bpm,
+            current_tick=session.current_tick,
+        )
         self._transport_epoch = 0
         self._last_snapshot_ns = 0
         self._lifecycle = "ready"
@@ -413,17 +435,30 @@ class FourChannelGuiRuntime:
             cutoff_ns = self.clock_ns()
 
         pending.sort(key=lambda item: (item[0], item[1]))
+        self._update_tempo(cutoff_ns)
         processed = False
+        clock_sent = False
         for timestamp_ns, _, item in pending:
             if self._stop_requested.is_set():
                 break
+            clock_sent = (
+                self._midi_realtime.process_due(
+                    now_ns=cutoff_ns,
+                    through_ns=timestamp_ns,
+                    allow_clock=not clock_sent,
+                    advance_before=self._advance_before_realtime,
+                )
+                or clock_sent
+            )
             tick = self._tick_at(timestamp_ns)
             if isinstance(item, mido.Message):
                 processed = True
                 if getattr(item, "type", None) == "clock":
                     self._midi_clock_tempo.observe(timestamp_ns)
                 try:
-                    self.session.process_midi_message(item, tick)
+                    self.session.process_midi_message(
+                        item, tick, on_reset=self._on_session_reset
+                    )
                 except Exception as error:
                     self._record_tape_changes(tick, None)
                     self._notify(
@@ -468,6 +503,15 @@ class FourChannelGuiRuntime:
                             )
                         )
                 self._last_processed_request_id = intent.request_id
+        clock_sent = (
+            self._midi_realtime.process_due(
+                now_ns=cutoff_ns,
+                through_ns=cutoff_ns,
+                allow_clock=not clock_sent,
+                advance_before=self._advance_before_realtime,
+            )
+            or clock_sent
+        )
         if not self._stop_requested.is_set():
             self._advance_to(self._tick_at(cutoff_ns))
             if processed:
@@ -477,7 +521,7 @@ class FourChannelGuiRuntime:
     def _apply_intent(self, intent: GuiIntent, tick: int) -> None:
         if intent.kind is GuiIntentKind.RESET:
             previous_reset_mode = self.session.reset_mode
-            self.session.reset(tick)
+            self.session.reset(tick, on_reset=self._on_session_reset)
             self._report_invalidated_loop_reset(previous_reset_mode)
             return
         self._advance_to(tick)
@@ -487,10 +531,34 @@ class FourChannelGuiRuntime:
         if intent.kind is GuiIntentKind.TRANSPORT:
             desired = bool(intent.value)
             if desired != self.session.transport_running:
+                self._midi_realtime.application_transport_changed(
+                    desired,
+                    now_ns=intent.submitted_at_ns,
+                    current_tick=self.session.current_tick,
+                )
                 self.session.toggle_transport()
                 self._clock_origin_ns = intent.submitted_at_ns
-                self._tick_origin = self.session.current_tick
+                self._tick_origin = float(self.session.current_tick)
                 self._transport_epoch += 1
+            return
+        if intent.kind is GuiIntentKind.MIDI_OUTPUT:
+            if not isinstance(intent.value, str):
+                raise TypeError("MIDI output command must be a string")
+            target, mode_name = parse_midi_output_command(intent.value)
+            mode = MidiOutputMode(mode_name)
+            if target == "transport":
+                self._midi_realtime.set_transport_mode(
+                    mode,
+                    now_ns=intent.submitted_at_ns,
+                    transport_running=self.session.transport_running,
+                )
+            else:
+                self._midi_realtime.set_clock_mode(
+                    mode,
+                    now_ns=intent.submitted_at_ns,
+                    transport_running=self.session.transport_running,
+                    current_tick=self.session.current_tick,
+                )
             return
         if intent.kind is GuiIntentKind.RECORDING_ARM:
             self.session.set_recording_armed(bool(intent.value))
@@ -573,16 +641,57 @@ class FourChannelGuiRuntime:
     def _tick_at(self, timestamp_ns: int) -> int:
         if not self.session.transport_running:
             return self.session.current_tick
+        tick = int(self._tick_position_at(timestamp_ns))
+        if self._timestamp_at_tick(tick + 1) <= timestamp_ns:
+            tick += 1
+        return max(self.session.current_tick, tick)
+
+    def _tick_position_at(self, timestamp_ns: int) -> float:
+        if not self.session.transport_running:
+            return float(self.session.current_tick)
         elapsed_ns = max(0, timestamp_ns - self._clock_origin_ns)
-        ticks = elapsed_ns * self.session.bpm * TICKS_PER_BEAT / 60_000_000_000
-        return max(self.session.current_tick, self._tick_origin + int(ticks))
+        ticks = elapsed_ns * self._tempo_bpm * TICKS_PER_BEAT / 60_000_000_000
+        return self._tick_origin + ticks
 
     def _advance_to(self, tick: int) -> None:
         if tick > self.session.current_tick:
             previous_reset_mode = self.session.reset_mode
-            self.session.advance(tick)
+            self.session.advance(tick, on_reset=self._on_session_reset)
             self._report_invalidated_loop_reset(previous_reset_mode)
             self._record_tape_changes(tick, None)
+
+    def _update_tempo(self, now_ns: int) -> None:
+        bpm = self.session.bpm
+        if bpm == self._tempo_bpm:
+            return
+        current_tick = self._tick_position_at(now_ns)
+        if self.session.transport_running:
+            self._clock_origin_ns = now_ns
+            self._tick_origin = max(
+                float(self.session.current_tick), current_tick
+            )
+        self._tempo_bpm = bpm
+        self._midi_realtime.set_tempo(now_ns, bpm)
+
+    def _advance_before_realtime(self, deadline_ns: int) -> None:
+        if not self.session.transport_running:
+            return
+        tick = self._tick_at(deadline_ns)
+        if self._timestamp_at_tick(tick) == deadline_ns:
+            tick = max(self.session.current_tick, tick - 1)
+        self._advance_to(tick)
+
+    def _timestamp_at_tick(self, tick: int) -> int:
+        tick_delta = tick - self._tick_origin
+        return self._clock_origin_ns + round(
+            tick_delta * 60_000_000_000
+            / (self._tempo_bpm * TICKS_PER_BEAT)
+        )
+
+    def _on_session_reset(self, _tick: int) -> None:
+        self._midi_realtime.reset(
+            transport_running=self.session.transport_running
+        )
 
     def _report_invalidated_loop_reset(self, previous_mode: ResetMode) -> None:
         if (
@@ -696,6 +805,13 @@ class FourChannelGuiRuntime:
             midi_in_bpm=self._midi_clock_tempo.bpm,
             midi_in_no_clock=self._midi_clock_tempo.no_clock(now_ns),
             last_processed_request_id=self._last_processed_request_id,
+            midi_transport_mode=self._midi_realtime.transport_mode.name,
+            midi_transport_active=self._midi_realtime.transport_active,
+            midi_transport_start_pending=(
+                self._midi_realtime.transport_start_pending
+            ),
+            midi_clock_mode=self._midi_realtime.clock_mode.name,
+            midi_clock_active=self._midi_realtime.clock_active,
         )
 
     def _channel_snapshot(self, index: int) -> GuiChannelSnapshot:
@@ -806,6 +922,9 @@ class FourChannelGuiRuntime:
             return (
                 f"Start {start_mode}; stop {stop_mode}"
             )
+        if intent.kind is GuiIntentKind.MIDI_OUTPUT:
+            target, mode = parse_midi_output_command(str(intent.value))
+            return f"MIDI {target} {mode}"
         if intent.kind is GuiIntentKind.RESET:
             return "Musical position reset"
         if intent.kind is GuiIntentKind.RESET_CONFIG:
@@ -875,6 +994,10 @@ class FourChannelGuiRuntime:
             intent.value, str
         ):
             raise TypeError("RESET_CONFIG requires a command string")
+        if intent.kind is GuiIntentKind.MIDI_OUTPUT and not isinstance(
+            intent.value, str
+        ):
+            raise TypeError("MIDI_OUTPUT requires a command string")
         if intent.kind is GuiIntentKind.LOOP_LENGTH and not isinstance(
             intent.value, str
         ):

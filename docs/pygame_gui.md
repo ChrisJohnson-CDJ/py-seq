@@ -63,6 +63,8 @@ lengths, channel numbers, or MIDI port names.
 | `reset off` | Disable automatic resets without changing position |
 | `reset beat [length]` | Reset at interval multiples from the current beat origin (default: 1 beat) |
 | `reset loop` | Reset at each future wrap of the reference channel |
+| `transport off\|on\|auto` | Set outgoing MIDI transport behavior |
+| `clock off\|on\|auto` | Set outgoing MIDI Clock behavior |
 
 Start and stop modes default to immediate. Configure a reference channel before
 using loop-synchronized recording or loop reset; the recording channel cannot
@@ -132,6 +134,27 @@ establishes the new global beat origin: the beat grid and beat-synchronized
 recording align to the reset, regardless of earlier loop or recording offsets.
 An automatic beat reset repeats after its configured interval from each reset;
 a loop reset waits for a complete reference-loop traversal after each reset.
+
+Outgoing MIDI transport and clock modes are independent, session-local
+settings that both default to `off`. `transport on` immediately sends MIDI
+Start and ignores later application transport and reset events;
+`transport off` immediately sends MIDI Stop and likewise ignores those events.
+`transport auto` follows application start and stop, sends Start at each reset
+while running, and sends Stop when selected while stopped. If selected during
+playback, its initial Start waits for the next 24-PPQN boundary. Transport
+messages use MIDI Start, not Continue.
+
+`clock on` continuously sends MIDI Timing Clock at 24 PPQN while the
+application is running or stopped. `clock auto` sends clock only while the
+application transport is running; selecting it during playback starts at the
+next clock boundary, while selecting it when stopped leaves clock output
+inactive. `clock off` disables clock output. The clock grid is independent of
+whether clock messages are enabled. In `clock on` mode, its phase continues
+through transport changes and resets; tempo changes update its rate without
+restarting the phase. In `clock auto` mode, clock follows the application's
+musical timing. The footer shows each configured mode and whether it is
+currently active. These output settings do not change playback, recording, or
+the application's transport.
 
 ## Recording and display
 

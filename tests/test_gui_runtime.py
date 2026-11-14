@@ -340,8 +340,8 @@ def test_arrivals_during_batch_are_not_overtaken_by_clock_advancement(monkeypatc
     runtime.enqueue_midi_message(mido.Message("clock"))
     original = session.process_midi_message
 
-    def process_and_enqueue(message, tick):
-        original(message, tick)
+    def process_and_enqueue(message, tick, **kwargs):
+        original(message, tick, **kwargs)
         if message.type == "clock":
             now[0] = 20_000_000
             runtime.enqueue_midi_message(
@@ -559,12 +559,12 @@ def test_worker_orders_backlogged_midi_and_active_gesture_stop_command(monkeypat
     release = threading.Event()
     original = session.process_midi_message
 
-    def blocked_message(message, tick):
+    def blocked_message(message, tick, **kwargs):
         if not entered.is_set():
             entered.set()
             if not release.wait(2):
                 raise TimeoutError("test did not release MIDI worker")
-        original(message, tick)
+        original(message, tick, **kwargs)
 
     monkeypatch.setattr(session, "process_midi_message", blocked_message)
     runtime = FourChannelGuiRuntime(session, clock_ns=clock)
@@ -1432,3 +1432,87 @@ def test_shutdown_cleanup_failure_is_reported_in_terminal_snapshot():
     assert "MIDI output close: port close failed" in (
         snapshot.terminal_message or ""
     )
+
+
+def test_runtime_midi_output_defaults_off_and_routes_realtime_once_per_sink():
+    sink = CollectingMidiSink()
+    routes = (
+        MidiRoute("OUT1", 0, sink, 0),
+        MidiRoute("OUT2", 1, sink, 0),
+        MidiRoute("OUT3", 2, sink, 0),
+        MidiRoute("OUT4", 3, sink, 0),
+    )
+    session = FourChannelSession((3840, 4800, 5760, 6720), 120, routes)
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+
+    snapshot = runtime.get_snapshot()
+    assert snapshot.midi_transport_mode == "OFF"
+    assert snapshot.midi_clock_mode == "OFF"
+    assert not snapshot.midi_transport_active
+    assert not snapshot.midi_clock_active
+
+    runtime._apply_intent(
+        GuiIntent(1, 0, GuiIntentKind.MIDI_OUTPUT, value="trans on"), 0
+    )
+    assert sink.messages == [mido.Message("start")]
+    assert runtime._make_snapshot(0).midi_transport_mode == "ON"
+    assert runtime._make_snapshot(0).midi_transport_active
+
+
+def test_runtime_auto_transport_emits_starts_for_recurring_resets():
+    session, sinks = make_session()
+    session.configure_reset(ResetMode.BEAT, interval_ticks=40)
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+
+    runtime._apply_intent(
+        GuiIntent(1, 0, GuiIntentKind.TRANSPORT, value=True), 0
+    )
+    runtime._apply_intent(
+        GuiIntent(2, 0, GuiIntentKind.MIDI_OUTPUT, value="transport auto"), 0
+    )
+    assert runtime._make_snapshot(0).midi_transport_start_pending
+
+    runtime._advance_to(120)
+    assert sinks[0].messages == [mido.Message("start")] * 3
+    assert not runtime._make_snapshot(0).midi_transport_start_pending
+
+    runtime._advance_to(121)
+    runtime._apply_intent(GuiIntent(3, 0, GuiIntentKind.RESET), 121)
+    assert sinks[0].messages == [mido.Message("start")] * 4
+
+    runtime._apply_intent(
+        GuiIntent(4, 0, GuiIntentKind.TRANSPORT, value=False), 121
+    )
+    assert sinks[0].messages[-1] == mido.Message("stop")
+
+
+def test_runtime_auto_transport_does_not_start_for_a_stopped_reset():
+    session, sinks = make_session()
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: 0)
+    runtime._apply_intent(
+        GuiIntent(1, 0, GuiIntentKind.MIDI_OUTPUT, value="transport auto"), 0
+    )
+    runtime._apply_intent(GuiIntent(2, 0, GuiIntentKind.RESET), 0)
+
+    assert sinks[0].messages == [mido.Message("stop")]
+
+
+def test_runtime_sends_due_clock_before_note_on_at_shared_ppqn_boundary():
+    now = [0]
+    session, sinks = make_session()
+    session.tape(0).insert(IntervalInsert(40, 20, 60, 90, 1))
+    runtime = FourChannelGuiRuntime(session, clock_ns=lambda: now[0])
+
+    runtime._apply_intent(
+        GuiIntent(1, 0, GuiIntentKind.TRANSPORT, value=True), 0
+    )
+    runtime._apply_intent(
+        GuiIntent(2, 0, GuiIntentKind.MIDI_OUTPUT, value="clock on"), 0
+    )
+    now[0] = round(60_000_000_000 / (24 * session.bpm))
+    runtime._process_pending()
+
+    assert sinks[0].messages == [
+        mido.Message("clock"),
+        mido.Message("note_on", channel=0, note=60, velocity=90),
+    ]

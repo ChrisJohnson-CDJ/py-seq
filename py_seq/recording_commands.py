@@ -102,6 +102,19 @@ def parse_length_command(command: str) -> int:
     return length_ticks
 
 
+def parse_midi_output_command(command: str) -> tuple[str, str]:
+    if not isinstance(command, str):
+        raise TypeError("command must be a string")
+    parts = command.strip().lower().split()
+    if len(parts) != 2:
+        raise ValueError(
+            "use 'transport off|on|auto' or 'clock off|on|auto'"
+        )
+    target = resolve_keyword(parts[0], ("transport", "clock"))
+    mode = resolve_keyword(parts[1], ("off", "on", "auto"))
+    return target, mode
+
+
 def parse_reset_command(command: str) -> ResetCommand:
     if not isinstance(command, str):
         raise TypeError("command must be a string")
@@ -245,6 +258,7 @@ def parse_recording_sync_command(command: str) -> RecordingSyncCommand:
 
 __all__ = [
     "parse_length_command",
+    "parse_midi_output_command",
     "parse_musical_length",
     "RecordingSyncCommand",
     "ResetCommand",

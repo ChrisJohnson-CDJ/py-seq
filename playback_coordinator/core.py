@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 
 from articulator import Articulator, LiveVoice, NoteAction
 from interval_resolver import RecordMode
@@ -118,6 +119,7 @@ class PlaybackCoordinator:
         tick: int,
         *,
         disarm_channels: tuple[int, ...] = (),
+        before_reset: Callable[[], None] | None = None,
     ) -> None:
         """Atomically rebase all loop phases without disturbing live input."""
         tick = _tick(tick)
@@ -141,6 +143,9 @@ class PlaybackCoordinator:
                     )
                 except MidiOutputError as error:
                     errors.append(error)
+
+        if before_reset is not None:
+            before_reset()
 
         for channel in self.channels:
             actions = channel.articulator.reset_playback()
