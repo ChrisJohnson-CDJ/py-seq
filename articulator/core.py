@@ -181,6 +181,10 @@ class Articulator:
         self._playback_interval = None
         self._playback_eligible = False
 
+    def release_output(self) -> tuple[NoteAction, ...]:
+        """Release the sounding note without changing live or playback state."""
+        return tuple(self._release_sounding())
+
     def _matches_playback(self, interval: VoiceInterval) -> bool:
         return (
             self._playback_interval is not None

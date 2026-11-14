@@ -26,10 +26,12 @@ from .recording_commands import (
     parse_bpm_command,
     parse_length_command,
     parse_midi_output_command,
+    parse_midi_config_command,
     parse_recording_sync_command,
     parse_reset_command,
     resolve_keyword,
 )
+from .midi_config import MidiConfig, UnassignedMidiSink, config_path, load_config
 from .gui_runtime import (
     FourChannelGuiRuntime,
     GuiChannelSnapshot,
@@ -135,6 +137,46 @@ class CommandHistory:
             return self._commands[self._position]
         self._position = None
         return self._draft
+
+
+class MidiDeviceCompletion:
+    def __init__(self) -> None:
+        self._last = ""
+        self._names: list[str] = []
+        self._index = -1
+
+    def complete(self, text: str) -> tuple[str, str | None]:
+        match = re.fullmatch(r"\s*(\S+)\s+(\S+)\s+(\d+)(?:\s+.*)?", text)
+        if match is None:
+            return text, None
+        try:
+            keyword = resolve_keyword(
+                match.group(1).lower(),
+                (
+                    "reset", "length", "start", "stop", "reference",
+                    "transport", "clock", "bpm", "tempo", "midi",
+                ),
+            )
+            if keyword != "midi":
+                return text, None
+            target = resolve_keyword(match.group(2).lower(), ("in", "out", "label"))
+        except ValueError:
+            return text, None
+        if target not in ("in", "out") or not 1 <= int(match.group(3)) <= 16:
+            return text, None
+        if text != self._last:
+            self._names = _get_port_names(
+                "get_input_names" if target == "in" else "get_output_names"
+            )
+            self._index = -1
+        if not self._names:
+            return text, f"No MIDI {target} devices available"
+        self._index = (self._index + 1) % len(self._names)
+        self._last = (
+            f"{match.group(1)} {match.group(2)} {match.group(3)} "
+            f"{self._names[self._index]}"
+        )
+        return self._last, None
 
 
 def parse_program_command(command: str) -> ParsedProgramCommand:
@@ -629,7 +671,7 @@ def _draw_ui(
             else _loop_label(relative_position, loop_beats)
         )
         metadata = (
-            f"{channel.name}   MIDI CH {channel.midi_channel + 1:02d}   "
+            f"{chr(ord('A') + index)} {channel.name}   MIDI CH {channel.midi_channel + 1:02d}   "
             f"BANK {channel.bank_msb:03d}  PRG {channel.program:03d}   "
             f"LOOP {length_label}   {loop_label}"
         )
@@ -813,6 +855,7 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
         command_mode = False
         command_text = ""
         command_history = CommandHistory()
+        midi_completion = MidiDeviceCompletion()
         show_seconds = False
         closing = False
         status_text = "Ready"
@@ -914,6 +957,19 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                             command_text = command_history.next(command_text)
                         elif event.key == pygame.K_BACKSPACE:
                             command_text = command_text[:-1]
+                        elif event.key == pygame.K_TAB:
+                            try:
+                                command_text, completion_error = midi_completion.complete(
+                                    command_text
+                                )
+                                if completion_error:
+                                    status_text = completion_error
+                                    status_until = time.monotonic() + 5
+                                    status_severity = "error"
+                            except Exception as error:
+                                status_text = f"MIDI discovery failed: {error}"
+                                status_until = time.monotonic() + 5
+                                status_severity = "error"
                         elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                             try:
                                 command_parts = command_text.strip().lower().split(
@@ -941,6 +997,7 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                             "clock",
                                             "bpm",
                                             "tempo",
+                                            "midi",
                                         ),
                                     )
                                 if command_word == "reset":
@@ -978,6 +1035,18 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                                     parse_bpm_command(command_text)
                                     request_id = submit_projected(
                                         GuiIntentKind.BPM_CHANGE,
+                                        value=command_text,
+                                    )
+                                elif command_word == "midi":
+                                    parse_midi_config_command(command_text)
+                                    selected = projected.get(
+                                        "selected_channel_id", snapshot.selected_channel_id
+                                    )
+                                    if not isinstance(selected, str):
+                                        selected = snapshot.selected_channel_id
+                                    request_id = submit_projected(
+                                        GuiIntentKind.MIDI_CONFIG,
+                                        channel_id=selected,
                                         value=command_text,
                                     )
                                 else:
@@ -1028,6 +1097,7 @@ def run_gui(runtime: FourChannelGuiRuntime, *, fps: int = FRAME_RATE) -> None:
                             command_mode = True
                             command_text = ""
                             command_history.reset_navigation()
+                            midi_completion = MidiDeviceCompletion()
                         elif event.key == pygame.K_q:
                             closing = True
                         elif event.key == pygame.K_r:
@@ -1218,33 +1288,48 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_midi:
         return 0 if list_midi_ports() else 1
 
-    output_sinks: list[MidoOutputPortSink] = []
     session: FourChannelSession | None = None
     runtime: FourChannelGuiRuntime | None = None
-    input_port = None
     try:
-        routes = _open_outputs(args, output_sinks)
-        session = FourChannelSession(tuple(args.length), args.bpm, routes)
+        path = config_path()
+        config = load_config(path)
+        if args.midi_in is not None:
+            try:
+                names = _get_port_names("get_input_names")
+                if args.midi_in >= len(names):
+                    raise ValueError(f"input index {args.midi_in} is unavailable")
+                config.input.device = names[args.midi_in]
+            except Exception as error:
+                logger.warning("Cannot resolve MIDI input override: %s", error)
+        if args.midi_out:
+            try:
+                names = _get_port_names("get_output_names")
+            except Exception as error:
+                logger.warning("Cannot enumerate MIDI output overrides: %s", error)
+                names = []
+            for channel, index, midi_channel, label in args.midi_out:
+                if index >= len(names):
+                    logger.warning("MIDI output index %s is unavailable", index)
+                    continue
+                setting = config.outputs[channel - 1]
+                setting.device = names[index]
+                setting.channel = midi_channel + 1
+                setting.label = label
+        routes = tuple(
+            MidiRoute(item.label, item.channel - 1, UnassignedMidiSink())
+            for item in config.outputs
+        )
+        session = FourChannelSession(
+            tuple(args.length), args.bpm, (routes[0], routes[1], routes[2], routes[3])
+        )
         runtime = FourChannelGuiRuntime(
             session,
-            output_sinks=tuple(output_sinks),
+            midi_config=config,
+            midi_config_path=path,
         )
-        if args.midi_in is not None:
-            names = _get_port_names("get_input_names")
-            if args.midi_in >= len(names):
-                raise ValueError(
-                    f"MIDI input index {args.midi_in} is unavailable; "
-                    f"current input count is {len(names)}"
-                )
-            open_input = getattr(mido, "open_input", None)
-            if not callable(open_input):
-                raise RuntimeError("Mido does not provide an input-port factory")
-            input_port = cast(Callable[..., Any], open_input)(
-                names[args.midi_in],
-                callback=runtime.enqueue_midi_message,
-            )
-            runtime.attach_input_port(input_port)
-            input_port = None
+        runtime.connect_configured_midi()
+        if args.midi_in is not None or args.midi_out:
+            runtime.save_midi_config()
         session = None
         run_gui(runtime, fps=args.fps)
         runtime = None
@@ -1255,15 +1340,9 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if runtime is not None:
             runtime.close(timeout=runtime.shutdown_timeout)
-            if input_port is not None:
-                input_port.close()
         else:
             if session is not None:
                 session.close()
-            if input_port is not None:
-                input_port.close()
-            for sink in output_sinks:
-                sink.close()
     return 0
 
 

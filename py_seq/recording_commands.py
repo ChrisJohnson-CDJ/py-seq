@@ -61,6 +61,28 @@ class ResetCommand:
         )
 
 
+def parse_midi_config_command(command: str) -> tuple[str, int | None, str]:
+    parts = command.strip().split(maxsplit=2)
+    if len(parts) < 3:
+        raise ValueError("use 'midi in|out {channel} {device}' or 'midi label {text}'")
+    resolve_keyword(parts[0].lower(), ("midi",))
+    target = resolve_keyword(parts[1].lower(), ("in", "out", "label"))
+    if target == "label":
+        label = parts[2].strip()
+        if label.lower() == "clear":
+            label = ""
+        if len(label) > 8:
+            raise ValueError("MIDI label must be at most 8 characters")
+        return target, None, label
+    arguments = parts[2].split(maxsplit=1)
+    if len(arguments) != 2 or not arguments[0].isascii() or not arguments[0].isdigit():
+        raise ValueError("use 'midi in|out {channel} {device}'")
+    channel = int(arguments[0])
+    if not 1 <= channel <= 16:
+        raise ValueError("MIDI channel must be between 1 and 16")
+    return target, channel, arguments[1].strip()
+
+
 def parse_musical_length(
     expression: str,
     *,

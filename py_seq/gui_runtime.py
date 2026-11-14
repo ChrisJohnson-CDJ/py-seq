@@ -7,25 +7,31 @@ import queue
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum, auto
+from pathlib import Path
 from typing import Protocol
 
 import mido
 
 from interval_resolver import RecordMode
-from midi_output import MidiMessageSink
+from midi_output import MidiMessageSink, MidiOutputAdapter, MidoOutputPortSink
+from .midi_config import MidiConfig, UnassignedMidiSink, save_config
 from .midi_realtime import MidiOutputMode, MidiRealtimeOutput
 from .four_channel_session import (
     CHANNEL_COUNT,
     TICKS_PER_BEAT,
     FourChannelSession,
+    MidiRoute,
     ResetMode,
 )
 from .recording_commands import (
     parse_bpm_command,
     parse_length_command,
     parse_midi_output_command,
+    parse_midi_config_command,
     parse_recording_sync_command,
     parse_reset_command,
 )
@@ -90,6 +96,7 @@ class GuiIntentKind(Enum):
     PROGRAM = auto()
     BANK_PROGRAM = auto()
     MIDI_OUTPUT = auto()
+    MIDI_CONFIG = auto()
     SHUTDOWN = auto()
 
 
@@ -199,6 +206,8 @@ class FourChannelGuiRuntime:
         *,
         input_port: _InputPort | None = None,
         output_sinks: tuple[object, ...] = (),
+        midi_config: MidiConfig | None = None,
+        midi_config_path: Path | None = None,
         clock_ns=time.monotonic_ns,
         tick_interval: float = 0.002,
         snapshot_interval: float = 0.05,
@@ -217,6 +226,15 @@ class FourChannelGuiRuntime:
         self.session = session
         self.input_port = input_port
         self.output_sinks = output_sinks
+        self.midi_config = midi_config
+        self.midi_config_path = midi_config_path
+        self._config_writer = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="py-seq-midi-config")
+            if midi_config_path is not None
+            else None
+        )
+        self._managed_outputs: dict[str, MidoOutputPortSink] = {}
+        self._input_generation = 0
         self.clock_ns = clock_ns
         self.tick_interval = tick_interval
         self.snapshot_interval = snapshot_interval
@@ -225,9 +243,9 @@ class FourChannelGuiRuntime:
         self._notifications: queue.Queue[GuiNotification] = queue.Queue(
             notification_capacity
         )
-        self._midi_events: queue.Queue[tuple[mido.Message, int]] = queue.Queue(
-            input_capacity
-        )
+        self._midi_events: queue.Queue[
+            tuple[mido.Message, int, int | None]
+        ] = queue.Queue(input_capacity)
         self._event_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop_requested = threading.Event()
@@ -301,6 +319,120 @@ class FourChannelGuiRuntime:
         self.input_port = input_port
         self._snapshot = self._make_snapshot(self.clock_ns())
 
+    def connect_configured_midi(self) -> None:
+        if self._lifecycle != "ready" or self.midi_config is None:
+            raise RuntimeError("MIDI configuration must be connected before startup")
+        for index in range(CHANNEL_COUNT):
+            self._replace_output(index)
+        self._replace_input()
+        self._snapshot = self._make_snapshot(self.clock_ns())
+
+    def _report_midi_problem(self, message: str) -> None:
+        logger.warning("%s", message)
+        self._notify(GuiNotification(None, "midi_config_error", message, "warning"))
+
+    def save_midi_config(self) -> None:
+        if (
+            self._config_writer is None
+            or self.midi_config_path is None
+            or self.midi_config is None
+        ):
+            return
+        config = deepcopy(self.midi_config)
+        path = self.midi_config_path
+
+        def write() -> None:
+            if not save_config(path, config):
+                self._report_midi_problem(f"Could not save MIDI configuration: {path}")
+
+        self._config_writer.submit(write)
+
+    def _replace_output(self, index: int) -> None:
+        assert self.midi_config is not None
+        setting = self.midi_config.outputs[index]
+        channel = self.session.coordinator.channels[index]
+        try:
+            channel.output.send_actions(channel.articulator.release_output())
+        except Exception as error:
+            self._report_midi_problem(f"Could not release MIDI output: {error}")
+        routes = list(self.session.routes)
+        routes[index] = MidiRoute(
+            setting.label, setting.channel - 1, UnassignedMidiSink()
+        )
+        self.session.routes = (routes[0], routes[1], routes[2], routes[3])
+        channel.output = MidiOutputAdapter(routes[index].sink, setting.channel - 1)
+
+        for name, sink in tuple(self._managed_outputs.items()):
+            if name != setting.device and not any(
+                route.sink is sink for route in self.session.routes
+            ):
+                del self._managed_outputs[name]
+                try:
+                    sink.close()
+                except Exception as error:
+                    self._report_midi_problem(
+                        f"Could not close MIDI output {name}: {error}"
+                    )
+
+        sink = self._managed_outputs.get(setting.device or "")
+        if setting.device and sink is None:
+            try:
+                if setting.device not in getattr(mido, "get_output_names")():
+                    raise ValueError("device not found")
+                sink = MidoOutputPortSink(setting.device)
+                self._managed_outputs[setting.device] = sink
+            except Exception as error:
+                self._report_midi_problem(
+                    f"MIDI output {setting.device} unavailable: {error}"
+                )
+        if sink is not None:
+            routes[index] = MidiRoute(setting.label, setting.channel - 1, sink, 0)
+            self.session.routes = (routes[0], routes[1], routes[2], routes[3])
+            channel.output = MidiOutputAdapter(sink, setting.channel - 1)
+        unique: dict[int, MidiMessageSink] = {}
+        for route in self.session.routes:
+            if route.port_index is not None:
+                unique[id(route.sink)] = route.sink
+        self._midi_realtime.set_sinks(tuple(unique.values()))
+
+    def _replace_input(self) -> None:
+        assert self.midi_config is not None
+        setting = self.midi_config.input
+        with self._event_lock:
+            self._input_generation += 1
+            generation = self._input_generation
+        old_port = self.input_port
+        self.input_port = None
+        if old_port is not None:
+            try:
+                old_port.close()
+            except Exception as error:
+                self._report_midi_problem(f"Could not close MIDI input: {error}")
+            try:
+                self.session.coordinator.replace_input(self.session.current_tick)
+            except Exception as error:
+                self._report_midi_problem(
+                    f"Could not release MIDI input notes: {error}"
+                )
+            finally:
+                self.session.preprocessor.reset()
+                self._sync_live_voices(self.session.current_tick)
+        if setting.device is not None:
+            try:
+                if setting.device not in getattr(mido, "get_input_names")():
+                    raise ValueError("device not found")
+
+                def callback(message: mido.Message) -> None:
+                    self._enqueue_midi_message(message, generation)
+
+                self.input_port = getattr(mido, "open_input")(
+                    setting.device, callback=callback
+                )
+            except Exception as error:
+                self._report_midi_problem(
+                    f"MIDI input {setting.device} unavailable: {error}"
+                )
+
     def submit(
         self,
         kind: GuiIntentKind,
@@ -350,11 +482,20 @@ class FourChannelGuiRuntime:
         return tuple(notifications)
 
     def enqueue_midi_message(self, message: mido.Message) -> None:
+        self._enqueue_midi_message(message, None)
+
+    def _enqueue_midi_message(
+        self, message: mido.Message, generation: int | None
+    ) -> None:
         if not isinstance(message, mido.Message):
             raise TypeError("message must be a mido.Message")
         with self._event_lock:
+            if generation is not None and generation != self._input_generation:
+                return
             try:
-                self._midi_events.put_nowait((message.copy(), self.clock_ns()))
+                self._midi_events.put_nowait(
+                    (message.copy(), self.clock_ns(), generation)
+                )
             except queue.Full:
                 with self._input_overflow_lock:
                     self._midi_input_overflow_count += 1
@@ -424,10 +565,10 @@ class FourChannelGuiRuntime:
         with self._event_lock:
             while True:
                 try:
-                    message, timestamp_ns = self._midi_events.get_nowait()
+                    message, timestamp_ns, generation = self._midi_events.get_nowait()
                 except queue.Empty:
                     break
-                pending.append((timestamp_ns, 0, message))
+                pending.append((timestamp_ns, 0, (message, generation)))
             while True:
                 try:
                     intent = self._commands.get_nowait()
@@ -453,13 +594,24 @@ class FourChannelGuiRuntime:
                 or clock_sent
             )
             tick = self._tick_at(timestamp_ns)
-            if isinstance(item, mido.Message):
+            if isinstance(item, tuple):
+                message, generation = item
+                assert isinstance(message, mido.Message)
+                if generation is not None and generation != self._input_generation:
+                    continue
                 processed = True
-                if getattr(item, "type", None) == "clock":
+                if (
+                    self.midi_config is not None
+                    and getattr(message, "type", None) in ("note_on", "note_off")
+                    and getattr(message, "channel", None)
+                    != self.midi_config.input.channel - 1
+                ):
+                    continue
+                if getattr(message, "type", None) == "clock":
                     self._midi_clock_tempo.observe(timestamp_ns)
                 try:
                     self.session.process_midi_message(
-                        item, tick, on_reset=self._on_session_reset
+                        message, tick, on_reset=self._on_session_reset
                     )
                 except Exception as error:
                     self._record_tape_changes(tick, None)
@@ -561,6 +713,35 @@ class FourChannelGuiRuntime:
                     transport_running=self.session.transport_running,
                     current_tick=self.session.current_tick,
                 )
+            return
+        if intent.kind is GuiIntentKind.MIDI_CONFIG:
+            if self.midi_config is None or not isinstance(intent.value, str):
+                raise ValueError("MIDI configuration is unavailable")
+            target, channel, value = parse_midi_config_command(intent.value)
+            if target == "in":
+                assert channel is not None
+                self.midi_config.input.device = value
+                self.midi_config.input.channel = channel
+                self._replace_input()
+            else:
+                index = self._channel_index(intent.channel_id)
+                if index != self.session.active_channel:
+                    raise ValueError("selected channel changed before command was applied")
+                setting = self.midi_config.outputs[index]
+                if target == "label":
+                    setting.label = value
+                    route = self.session.routes[index]
+                    routes = list(self.session.routes)
+                    routes[index] = MidiRoute(
+                        value, route.midi_channel, route.sink, route.port_index
+                    )
+                    self.session.routes = (routes[0], routes[1], routes[2], routes[3])
+                else:
+                    assert channel is not None
+                    setting.device = value
+                    setting.channel = channel
+                    self._replace_output(index)
+            self.save_midi_config()
             return
         if intent.kind is GuiIntentKind.BPM_CHANGE:
             if not isinstance(intent.value, str):
@@ -884,7 +1065,7 @@ class FourChannelGuiRuntime:
                 cleanup_errors.append(f"MIDI input close: {error}")
                 logger.exception("failed to close MIDI input")
         closed: set[int] = set()
-        for sink in self.output_sinks:
+        for sink in (*self.output_sinks, *self._managed_outputs.values()):
             if id(sink) in closed:
                 continue
             closed.add(id(sink))
@@ -895,6 +1076,8 @@ class FourChannelGuiRuntime:
                 except Exception as error:
                     cleanup_errors.append(f"MIDI output close: {error}")
                     logger.exception("failed to close MIDI output")
+        if self._config_writer is not None:
+            self._config_writer.shutdown(wait=True)
         if cleanup_errors:
             detail = "; ".join(cleanup_errors)
             self._terminal_message = (
@@ -933,6 +1116,8 @@ class FourChannelGuiRuntime:
         if intent.kind is GuiIntentKind.MIDI_OUTPUT:
             target, mode = parse_midi_output_command(str(intent.value))
             return f"MIDI {target} {mode}"
+        if intent.kind is GuiIntentKind.MIDI_CONFIG:
+            return "MIDI configuration updated"
         if intent.kind is GuiIntentKind.BPM_CHANGE:
             return f"Tempo set to {self.session.bpm:g} BPM"
         if intent.kind is GuiIntentKind.RESET:
@@ -1008,6 +1193,10 @@ class FourChannelGuiRuntime:
             intent.value, str
         ):
             raise TypeError("MIDI_OUTPUT requires a command string")
+        if intent.kind is GuiIntentKind.MIDI_CONFIG and not isinstance(
+            intent.value, str
+        ):
+            raise TypeError("MIDI_CONFIG requires a command string")
         if intent.kind is GuiIntentKind.BPM_CHANGE and not isinstance(
             intent.value, str
         ):

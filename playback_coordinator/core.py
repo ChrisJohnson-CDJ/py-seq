@@ -276,6 +276,17 @@ class PlaybackCoordinator:
         if errors:
             raise ExceptionGroup("failed to silence all MIDI outputs", errors)
 
+    def replace_input(self, tick: int) -> None:
+        """End the old input gesture without stopping unrelated playback."""
+        tick = _tick(tick)
+        self._advance_to(tick)
+        channel = self.channels[self._focused_channel]
+        channel.recorder.reset_input(tick)
+        self._reconcile(channel, tick)
+        self._emit(channel, channel.articulator.set_live_voice(None))
+        self._input_gesture_id = None
+        self._suppressed_recording_gesture_id = None
+
     def _advance_to(self, tick: int) -> None:
         if tick < self._current_tick:
             raise ValueError("tick must be nondecreasing; use seek() for discontinuities")

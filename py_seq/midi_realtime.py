@@ -92,6 +92,9 @@ class MidiRealtimeOutput:
     def transport_mode(self) -> MidiOutputMode:
         return self._transport_mode
 
+    def set_sinks(self, sinks: tuple[MidiMessageSink, ...]) -> None:
+        self._sinks = sinks
+
     @property
     def clock_mode(self) -> MidiOutputMode:
         return self._clock_mode

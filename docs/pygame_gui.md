@@ -67,6 +67,38 @@ lengths, channel numbers, or MIDI port names. `t` is ambiguous between
 | `reset loop` | Reset at each future wrap of the reference channel |
 | `transport off\|on\|auto` | Set outgoing MIDI transport behavior |
 | `clock off\|on\|auto` | Set outgoing MIDI Clock behavior |
+| `midi in {channel} {device}` | Configure the MIDI input device and MIDI channel |
+| `midi out {channel} {device}` | Configure the selected loop's output device and MIDI channel |
+| `midi label {text}` | Set the selected loop's display label (up to 8 characters) |
+| `midi label clear` | Clear the selected loop's display label |
+
+MIDI command channels are numbered 1–16 and are independent of loop selection.
+Device names are exact Mido names and may contain spaces. Command keywords
+accept unique prefixes; device names and label text are literal. In command
+entry, after `midi in 1` or `midi out 3`, Tab cycles through discovered input
+or output devices respectively, wrapping around. Enter applies the displayed
+device and Esc cancels. If no devices are available, the entry is unchanged
+and an error is displayed. Outside command entry, Tab still selects the next
+loop.
+
+MIDI configuration is saved automatically to
+`$XDG_CONFIG_HOME/py-seq/midi.json`, or `~/.config/py-seq/midi.json` when
+`XDG_CONFIG_HOME` is unset or not absolute. At startup, explicit MIDI
+command-line options override only their corresponding saved settings; other
+settings are restored. With no saved setting, the default is unassigned,
+channel 1, and no label. The existing `--midi-in` and `--midi-out` options
+still use current zero-based device indexes, and `--midi-out` still uses a
+zero-based MIDI channel. Resolved device names, not indexes, are saved.
+An index that cannot be resolved is reported and leaves that saved assignment
+unchanged.
+
+Configured devices and active connections are separate: an unavailable device
+is reported and remains configured, but its runtime route is disconnected.
+Its name and channel are retained for a future startup; no device is substituted
+or automatically reconnected. Input note messages are accepted on the
+configured MIDI channel; MIDI clock and transport messages remain channel
+independent. Changing a route does not reset transport, recording, or tapes.
+Labels are descriptive and appear alongside the A–D loop identities.
 
 Start and stop modes default to immediate. Configure a reference channel before
 using loop-synchronized recording or loop reset; the recording channel cannot
